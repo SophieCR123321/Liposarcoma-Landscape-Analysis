@@ -1,0 +1,2993 @@
+---
+title: "Integrating Samples"
+output: html_notebook
+---
+
+This notebook integrates all the samples, and then runs cell type annotation
+
+Prepare the R Environment
+```{r}
+##### Load the necessary libraries #####
+
+if (!requireNamespace("Seurat", quietly = TRUE)) install.packages("Seurat")
+library(Seurat)
+
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+library(ggplot2)
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+library(BiocManager)
+
+if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+if (!requireNamespace("harmony", quietly = TRUE)) {
+  remotes::install_github("immunogenomics/harmony")
+}
+library(harmony)
+
+if (!requireNamespace("copykat", quietly = TRUE)) {
+  remotes::install_github("navinlabcode/copykat")
+}
+library(copykat)
+
+if (!requireNamespace("SingleCellExperiment", quietly = TRUE)) BiocManager::install("SingleCellExperiment")
+library(SingleCellExperiment)
+
+if (!requireNamespace("scDblFinder", quietly = TRUE)) BiocManager::install("scDblFinder")
+library(scDblFinder)
+
+if (!requireNamespace("scater", quietly = TRUE)) BiocManager::install("scater")
+library(scater)
+
+if (!requireNamespace("SingleR", quietly = TRUE)) BiocManager::install("SingleR")
+library(SingleR)
+
+if (!requireNamespace("clustree", quietly = TRUE)) install.packages("clustree")
+library(clustree)
+
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+library(dplyr)
+
+#if (!requireNamespace("SeuratWrappers", quietly = TRUE)) {
+  #remotes::install_github("satijalab/seurat-wrappers")
+#}
+#library(SeuratWrappers)
+
+#if (!requireNamespace("glmGamPoi", quietly = TRUE)) BiocManager::install("glmGamPoi")
+#library(glmGamPoi)
+
+if (!requireNamespace("patchwork", quietly = TRUE)) install.packages("patchwork")
+library(patchwork)
+
+if (!requireNamespace("clusterProfiler", quietly = TRUE)) BiocManager::install("clusterProfiler")
+if (!requireNamespace("msigdbr", quietly = TRUE)) install.packages("msigdbr")
+if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) BiocManager::install("org.Hs.eg.db")
+
+library(clusterProfiler)
+library(dplyr)
+library(org.Hs.eg.db)
+library(msigdbr)
+
+set.seed(654)
+
+```
+
+Integrating and Preprocessing
+```{r}
+##### Integrating all the liposarcoma samples #####
+
+# List all the liposarcoma sample IDs
+liposarcoma_samples <- c(
+  "S446477", "S462405", "S469134", "S469138",
+  "S469145", "S472738", "S473587", "S473582"
+  )
+
+```
+
+```{r}
+##### Load and Preprocess Each Sample #####
+
+# Set the base directory for the raw data
+base_dir <- "~/Sarcoma2025/scProcessed"
+
+# Create an empty list to store each processed Seurat object
+seurat_list <- list()
+
+# Loop through each liposarcoma sample ID
+for (sample_id in liposarcoma_samples) {
+
+  # Build the file path for sample_X
+  data_path <- file.path(
+    base_dir,
+    sample_id,
+    "outs",
+    "filtered_feature_bc_matrix"
+    )
+
+  # Read in sample_X's data
+  seurat_data <- Read10X(data.dir = data_path)
+
+  # Prefix the cell barcodes with sample_X's ID
+  colnames(seurat_data) <- paste(
+    sample_id,
+    colnames(seurat_data),
+    sep = "_"
+    )
+
+  # Create a seurat object with quality control thresholds
+  seurat_obj <- CreateSeuratObject(
+    counts = seurat_data,
+    project = sample_id,
+    min.cells = 3,
+    min.features = 200
+    )
+
+  # Print number of cells before QC
+  message(sample_id, ": ", ncol(seurat_obj), " cells before QC")
+
+  # Tag cells with sample_X's ID
+  seurat_obj$orig.ident <- sample_id
+  seurat_obj$sample <- sample_id
+
+  # Calculate mitochondrial percentage
+  seurat_obj[["percent.mt"]] <- PercentageFeatureSet(
+    seurat_obj,
+    pattern = "^MT-"
+    )
+
+  # Subset high-quality cells based on thresholds
+  seurat_obj <- subset(
+    seurat_obj,
+    subset = nFeature_RNA > 500 &
+      nFeature_RNA < 6000 &
+      nCount_RNA < 30000 &
+      percent.mt < 10
+    )
+  
+
+  message(sample_id, ": ", ncol(seurat_obj), " cells after QC")
+  message(sample_id, ": ", nrow(seurat_obj), " genes retained after QC")
+  
+  # Convert to SingleCellExperiment
+  sce <- as.SingleCellExperiment(seurat_obj)
+  
+  # Run scDblFinder
+  sce <- scDblFinder(sce)
+  
+  # Add doublet classification to Seurat object
+  dbl_info <- colData(sce)[, c("scDblFinder.class", "scDblFinder.score")]
+  dbl_info <- as.data.frame(dbl_info)
+  seurat_obj <- AddMetaData(seurat_obj, metadata = dbl_info)
+  
+  # Filter singlets only
+  seurat_obj <- subset(seurat_obj, subset = scDblFinder.class == "singlet")
+  message(" - Remaining singlets: ", ncol(seurat_obj))
+  
+  # Store processed object
+  seurat_list[[sample_id]] <- seurat_obj
+}
+
+```
+
+```{r}
+##### Merge and SCTransform Normalization #####
+
+# Merge all the seurat obects from seurat_list
+combined_lipo <- merge(
+  seurat_list[[1]],
+  y = seurat_list[-1],
+  add.cell.ids = liposarcoma_samples,
+  project = "Liposarcoma_Integrated"
+)
+
+message("Merged dataset: ", ncol(combined_lipo), " cells, ", nrow(combined_lipo), " genes retained after QC")
+```
+
+```{r}
+
+# Perform normalisation, variance stabilisation, and scaling
+combined_lipo <- SCTransform(
+  combined_lipo,
+  assay = "RNA",
+  new.assay.name = "SCT",
+  method = "vst",
+  vars.to.regress = c("percent.mt", "nCount_RNA"),
+  verbose = TRUE
+)
+
+```
+
+```{r}
+##### Veryify SCTransform worked and confirm 3000 HVGs were selected #####
+
+# Safely print the names of assays (avoid namespace masking)
+assays_available <- Seurat::Assays(combined_lipo)
+cat("Available assays in the Seurat object:\\n")
+print(assays_available)
+
+# Set SCT as the default assay
+Seurat::DefaultAssay(combined_lipo) <- "SCT"
+
+# Get and report number of variable features (HVGs)
+hvgs <- Seurat::VariableFeatures(combined_lipo)
+cat("Number of highly variable genes (HVGs):", length(hvgs), "\\n")
+
+# Preview the top 10 variable genes
+cat("Top 10 HVGs:\\n")
+print(head(hvgs, 10))
+
+```
+
+Dimensionality Reduction and Basic Seurat Clustering
+```{r}
+##### Set up the plot output directory #####
+
+plot_dir <- file.path("results", "liposarcoma", "initial_plots")
+dir.create(
+  plot_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+  )
+
+```
+
+```{r}
+##### PCA Reduction #####
+
+# Run PCA to compute PCs
+combined_lipo <- RunPCA(
+  combined_lipo,
+  verbose = TRUE
+  )
+
+```
+
+```{r}
+##### Harmony Integration #####
+
+# Group by sample, correcting for batch effects in the process
+combined_lipo <- RunHarmony(
+  object = combined_lipo,
+  group.by.vars = "sample"
+)
+
+```
+
+```{r}
+##### PC Selection #####
+
+# View an elbow plot to determine the optimal number of PCs
+ElbowPlot(combined_lipo, ndims = 50) +
+  ggtitle("Elbow Plot to Determine Optimal Number of PCs")
+
+```
+
+```{r}
+elbow_func <- function(suerat_obj){
+  sdev <- suerat_obj[["pca"]]@stdev[1:50]
+
+  # Calculate variance explained
+  variance <- sdev^2
+  pc <- 1:length(variance)
+
+  # Normalize PCs and variance for Euclidean distance
+  norm_pc <- (pc - min(pc)) / (max(pc) - min(pc))
+  norm_var <- (variance - min(variance)) / (max(variance) - min(variance))
+
+  # Create a line from first to last point
+  line_start <- c(norm_pc[1], norm_var[1])
+  line_end <- c(norm_pc[length(norm_pc)], norm_var[length(norm_var)])
+
+  # Function to compute perpendicular distance from point to line
+  perpendicular_distance <- function(point, line_start, line_end) {
+    num <- abs((line_end[2] - line_start[2]) * point[1] -
+                (line_end[1] - line_start[1]) * point[2] +
+                line_end[1]*line_start[2] - line_end[2]*line_start[1])
+    denom <- sqrt((line_end[2] - line_start[2])^2 + (line_end[1] - line_start[1])^2)
+    return(num / denom)
+  }
+
+    # Apply to all points
+  distances <- mapply(function(x, y) perpendicular_distance(c(x, y), line_start, line_end),
+                      norm_pc, norm_var)
+
+  # Find the elbow point
+  elbow <- which.max(distances)
+  elbow_rounded <- ceiling(elbow)
+  return (elbow_rounded)
+}
+
+#How to use
+#Call elbow_func() with the suerat object inside it
+#e.g. x <- elbow_func(liposarcoma)
+#It'll return the inflection point, which gets stored in x, or you could pipe it
+
+```
+
+```{r}
+elbow_func(combined_lipo)
+```
+
+
+```{r}
+##### Define PC Selection #####
+
+# Set the number of optimal PCs to use
+dims_to_use <- 1:10
+
+```
+
+```{r}
+##### Initial Clustering and Clustree Inspection #####
+
+# Run UMAP for dimensionality reduction and visualisation
+combined_lipo <- RunUMAP(
+  combined_lipo,
+  reduction = "harmony",
+  dims = dims_to_use,
+  seed.use = 654
+  )
+
+# Run t-SNE for dimensionality reduction and visualisation
+combined_lipo <- RunTSNE(
+  combined_lipo,
+  reduction = "harmony",
+  dims = dims_to_use,
+  seed.use = 654
+  )
+
+# Build neighbour graph
+combined_lipo <- FindNeighbors(
+  combined_lipo,
+  reduction = "harmony",
+  dims = dims_to_use
+  )
+
+# Cluster cells at multiple resolutions for comparison
+combined_lipo <- FindClusters(
+  combined_lipo,
+  resolution = seq(0.1, 1.5, by = 0.1)
+  )
+
+# Visualise how clusters evolve across resolutions by creating a clustree
+clustree_plot <- clustree(
+  combined_lipo,
+  prefix = "SCT_snn_res."
+  )
+
+# Save the clustree plot
+ggsave(
+  file.path(plot_dir, "liposarcoma_Clustree.pdf"),
+  clustree_plot,
+  width = 10,
+  height = 15
+  )
+
+### VISUALLY INSPECT THE CLUSTREE TO DETERMINE WHICH RES YOU WANT TO USE ###
+
+```
+
+```{r}
+##### Define res #####
+
+# Set the optimal resolution
+Idents(combined_lipo) <- "SCT_snn_res.0.5"
+
+```
+
+```{r}
+##### Store seurat clusters in metadata #####
+
+# Save the default seurat cluster identities to the metadata 
+combined_lipo$seurat_clusters <- Idents(combined_lipo)  
+
+```
+
+```{r}
+##### UMAP and t-SNE Visualisation with seurat clusters #####
+
+# Counts per sample
+sample_counts <- table(combined_lipo$sample)
+sample_labels <- paste0(names(sample_counts), " (n=", sample_counts, ")")
+names(sample_labels) <- names(sample_counts)
+
+# Counts per cluster
+cluster_counts <- table(Idents(combined_lipo))
+cluster_labels <- paste0(names(cluster_counts), " (n=", cluster_counts, ")")
+names(cluster_labels) <- names(cluster_counts)
+
+# UMAP by sample
+seurat_sample_umap <- DimPlot(combined_lipo, reduction = "umap", group.by = "sample", label = TRUE, repel = TRUE, label.size = 6) +
+  ggtitle("Sample Distribution Across A UMAP") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2") +
+  scale_color_discrete(labels = sample_labels)
+
+ggsave(
+  file.path(plot_dir, "seurat_clusters_umap_by_sample.pdf"),
+  plot = seurat_sample_umap,
+  width = 15,
+  height = 8
+)
+
+# UMAP by clusters
+seurat_cluster_umap <- DimPlot(combined_lipo, reduction = "umap", label = TRUE, label.size = 6) +
+  ggtitle("UMAP Clustering") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2") +
+  scale_color_discrete(labels = cluster_labels)
+
+ggsave(
+  file.path(plot_dir, "seurat_clusters_umap_by_cluster.pdf"),
+  plot = seurat_cluster_umap,
+  width = 15,
+  height = 8
+)
+
+# t-SNE by sample
+seurat_sample_tsne <- DimPlot(combined_lipo, reduction = "tsne", group.by = "sample", label = TRUE, repel = TRUE, label.size = 6) +
+  ggtitle("Sample Distribtution Across A UMAP") +
+  xlab("t-SNE 1") +
+  ylab("t-SNE 2") +
+  scale_color_discrete(labels = sample_labels)
+
+ggsave(
+  file.path(plot_dir, "seurat_clusters_tsne_by_sample.pdf"),
+  plot = seurat_sample_tsne,
+  width = 15,
+  height = 8
+)
+
+# t-SNE by clusters
+seurat_cluster_tSNE <- DimPlot(combined_lipo, reduction = "tsne", label = TRUE, label.size = 6) +
+  ggtitle("t-SNE Clusters") +
+  xlab("t-SNE 1") +
+  ylab("t-SNE 2") +
+  scale_color_discrete(labels = cluster_labels)
+
+# Save t-SNE by clusters
+ggsave(
+  file.path(plot_dir, "seurat_clusters_tsne_by_cluster.pdf"),
+  plot = seurat_cluster_tSNE,
+  width = 15,
+  height = 8
+)
+
+print(seurat_cluster_tSNE)
+
+```
+
+```{r}
+##### Save the integrated Seurat object #####
+
+# Create output directory if it doesn’t exist
+save_dir <- file.path("results", "liposarcoma")
+dir.create(save_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Save as RDS (easiest way to share with someone using Seurat in R)
+saveRDS(
+  combined_lipo,
+  file = file.path(save_dir, "combined_lipo.rds")
+)
+
+```
+
+
+Marker Identification
+```{r}
+##### Identify Top Differential Marker Genes Per Cluster #####
+
+# Prepare the seurat object for FindAllMarkers()
+combined_lipo <- PrepSCTFindMarkers(combined_lipo)
+
+# Identify significantly upregulated genes in each cluster
+markers_combined_lipo <- FindAllMarkers(
+  combined_lipo,
+  only.pos = TRUE,           # Only return positive markers
+  min.pct = 0.25,            # Expressed in at least 25% of cells
+  logfc.threshold = 0.25     # Log fold-change threshold
+)
+
+# View how many marker genes were identified per cluster
+table(markers_combined_lipo$cluster)
+
+```
+
+```{r}
+##### Extract and Save the Top 10 Marker Genes per Cluster #####
+
+# Select the top 10 marker genes per cluster based on highest avg_log2FC
+top10_markers <- markers_combined_lipo %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10)
+
+# Save the top 10 markers as a csv
+write.csv(
+  top10_markers,
+  file = file.path(plot_dir, "top10_markers_per_cluster_before_SingleR.csv"),
+  row.names = FALSE
+)
+
+# View the top 10 markers
+print(top10_markers)
+
+```
+
+```{r}
+# order genes by cluster for nicer blocks
+features_by_cluster <- top10_markers %>%
+  arrange(as.numeric(cluster), desc(avg_log2FC)) %>%
+  pull(gene) %>% unique()
+
+# ensure SCT is default and scaled
+DefaultAssay(combined_lipo) <- "SCT"
+
+DoHeatmap(
+  combined_lipo,
+  features = features_by_cluster,
+  group.by = "seurat_clusters",  # or "cluster_refined_label"
+  size = 3
+) + ggtitle("Top 10 marker genes per cluster")
+ggsave(file.path(plot_dir, "heatmap_top10_markers_per_cluster.pdf"),
+       width = 12, height = 16)
+
+```
+
+```{r}
+# keep the same ordered features
+features_by_cluster <- top10_markers %>%
+  arrange(as.numeric(cluster), desc(avg_log2FC)) %>%
+  pull(gene) %>% unique()
+
+top10_dotplot <- DotPlot(
+  combined_lipo,
+  features = features_by_cluster,
+  group.by = "seurat_clusters",   # or "cluster_refined_label"
+  cols = c("lightgrey", "red"),
+  dot.scale = 3
+) +
+  ggtitle("DotPlot Of The Top 10 Markers Per Cluster") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8)) +
+  ylab("Cluster Identity") +
+  xlab("Gene")
+
+ggsave(
+  file.path(plot_dir, "dotplot_top10_markers_per_cluster.pdf"),
+  top10_dotplot,
+  width = 18,
+  height = 10
+)
+
+
+```
+
+
+```{r}
+##### Identify Unique Differential Marker Genes Per Cluster #####
+
+# Count how many clusters each gene is a marker for
+gene_cluster_counts <- markers_combined_lipo %>%
+  group_by(gene) %>%
+  summarise(n_clusters = n_distinct(cluster)) %>%
+  filter(n_clusters == 1)
+
+# Get the genes that are unique to a single cluster
+unique_genes <- gene_cluster_counts$gene
+
+# Subset the marker table to only include those unique genes
+unique_markers <- markers_combined_lipo %>%
+  filter(gene %in% unique_genes)
+
+write.csv(
+  unique_markers, 
+  file = file.path(plot_dir,"unique_markers_per_cluster.csv"), 
+  row.names = FALSE
+  )
+
+print(unique_markers)
+
+```
+
+```{r}
+##### Identify Number of Unique Differential Marker Genes Per Cluster #####
+
+# Find genes that are markers for only one cluster
+gene_cluster_counts <- markers_combined_lipo %>%
+  group_by(gene) %>%
+  summarise(n_clusters = n_distinct(cluster)) %>%
+  filter(n_clusters == 1)
+
+# Filter the marker table to keep only those genes
+unique_markers <- markers_combined_lipo %>%
+  filter(gene %in% gene_cluster_counts$gene)
+
+# Count the number of unique marker genes per cluster
+unique_gene_counts_per_cluster <- unique_markers %>%
+  group_by(cluster) %>%
+  summarise(n_unique_genes = n_distinct(gene))
+
+# View the result
+print(unique_gene_counts_per_cluster)
+
+```
+
+```{r}
+# unique_gene_counts_per_cluster already exists
+p_unique <- unique_gene_counts_per_cluster %>%
+  ggplot(aes(x = as.factor(cluster), y = n_unique_genes)) +
+  geom_col(fill = "turquoise3") +
+  geom_text(aes(label = n_unique_genes), vjust = -0.3, size = 3) +
+  labs(x = "Cluster", y = "Unique marker genes",
+       title = "Number Of Unique Markers Per Cluster") +
+  theme_minimal()
+
+ggsave(file.path(plot_dir, "unique_markers_per_cluster_barplot.pdf"),
+       p_unique, width = 7, height = 4)
+
+```
+
+```{r}
+##### Identify Common (Shared) Differential Marker Genes Across Clusters #####
+
+# Filter for statistically significant markers (FDR-adjusted p < 0.05)
+sig_markers <- markers_combined_lipo %>%
+  filter(p_val_adj < 0.05)
+
+# Count how many clusters each gene is a marker for
+gene_cluster_counts <- sig_markers %>%
+  group_by(gene) %>%
+  summarise(n_clusters = n_distinct(cluster)) %>%
+  filter(n_clusters > 1)
+
+# Get the genes that are markers for more than one cluster
+shared_genes <- gene_cluster_counts$gene
+
+# Subset the marker table to only include those shared genes
+shared_markers <- sig_markers %>%
+  filter(gene %in% shared_genes)
+
+# Save shared marker genes to CSV
+write.csv(
+  shared_markers,
+  file = file.path(plot_dir,"shared_markers_multiple_clusters.csv"),
+  row.names = FALSE
+)
+
+# Print summary of number of clusters each shared gene appears in
+shared_summary <- shared_markers %>%
+  group_by(gene) %>%
+  summarise(clusters = paste(unique(cluster), collapse = ", "),
+            n_clusters = n_distinct(cluster)) %>%
+  arrange(desc(n_clusters))
+
+print(shared_summary)
+
+# Save the summary table of shared marker genes to CSV
+write.csv(
+  shared_summary,
+  file = file.path(plot_dir,"shared_marker_summary.csv"),
+  row.names = FALSE
+)
+
+```
+
+```{r}
+library(ggplot2)
+
+# Create the data frame
+overlap_data <- data.frame(
+  Cluster_Groups = c(
+    "Clusters 0, 7, and 10",
+    "Clusters 8, 11, 14",
+    "Clusters 2, 3, 4, 12",
+    "Clusters 2, 3, 4",
+    "Clusters 1, 5, 6, 13"
+  ),
+  Number_of_Overlapping_Markers = c(200, 16, 3, 35, 76)
+)
+
+# Create the bar chart
+shared_marker_barplot <- ggplot(overlap_data, aes(x = Cluster_Groups, y = Number_of_Overlapping_Markers)) +
+  geom_col(fill = "turquoise3") +
+  geom_text(aes(label = Number_of_Overlapping_Markers), vjust = -0.3, size = 3) +
+  labs(
+    title = "Number of Overlapping Marker Genes per Cluster Group",
+    x = "Cluster Groups",
+    y = "Number of Overlapping Markers"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Save the plot
+ggsave(file = file.path(plot_dir, "overlapping_markers_per_cluster_group.pdf"), shared_marker_barplot, width = 7, height = 4)
+
+```
+
+Cell Type Annotation with SingleR Coarse Labels
+```{r}
+##### Set up plot output directory ####
+
+plot_dir <- file.path("results", "liposarcoma", "SingleR_plots")
+dir.create(
+  plot_dir, 
+  recursive = TRUE, 
+  showWarnings = FALSE
+  )
+
+```
+
+```{r}
+##### Run for SingleR coarse labels #####
+
+# Load the Blueprint+ENCODE reference dataset
+ref <- readRDS("HPCA_reference.rds")
+
+# Print reference version info
+ref@metadata$description
+
+# Convert Seurat object to SingleCellExperiment
+sce <- as.SingleCellExperiment(
+  combined_lipo, 
+  layers = "data"
+  )
+
+# Check available broad labels
+print(table(ref$label.main))
+
+# Run SingleR annotation using broad labels
+pred <- SingleR(
+  test = sce,
+  ref = ref,
+  labels = ref$label.main
+)
+
+# Save SingleR predictions
+saveRDS(pred, file = file.path(plot_dir, "SingleR_predictions_HPCA.rds"))
+
+```
+
+```{r}
+##### Store coarse SingleR labels in the metadata #####
+
+# Add predicted labels to Seurat object metadata
+combined_lipo$SingleR_HPCA <- pred$labels
+
+```
+
+```{r}
+##### Visualisation with coarse SingleR labels #####
+
+### Basic Visualisations (regular UMAPs and t-SNEs)
+
+# Plot UMAP with SingleR labels
+HPCA_UMAP <- DimPlot(combined_lipo, group.by = "SingleR_HPCA", reduction = "umap", label = TRUE, repel = TRUE) + ggtitle("SingleR HPCA Cell Type Predictions (UMAP)") + xlab("UMAP 1") + ylab("UMAP 2")
+
+ggsave(
+  filename = file.path(plot_dir, "combined_lipo_UMAP_SingleR_HPCA_broad.pdf"),
+  plot = HPCA_UMAP, width = 15, height = 8
+)
+
+# Plot t-SNE with SingleR labels
+HPCA_tSNE <- DimPlot(
+  combined_lipo,
+  group.by = "SingleR_HPCA",
+  reduction = "tsne",
+  label = TRUE,
+  repel = TRUE
+) + ggtitle("SingleR HPCA Cell Type Predictions (t-SNE)")+
+  xlab("t-SNE 1") +
+  ylab("t-SNE 2")
+
+ggsave(
+  filename = file.path(plot_dir, "combined_lipo_tSNE_SingleR_HPCA_broad.pdf"),
+  plot = HPCA_tSNE, width = 15, height = 8
+)
+
+##########################################################################
+
+# Visualise the t-SNEs of each individual cell type side-by-side (only those cells associated with the specified cell type are shown)
+
+HPCA_tSNE_separated <- DimPlot(
+  combined_lipo, 
+  group.by = "SingleR_HPCA", 
+  reduction = "tsne", 
+  label = FALSE, 
+  cols = NULL) +
+  facet_wrap(~ SingleR_HPCA) +
+  ggtitle("SingleR HPCA Cell Type Annotation (t-SNE): Faceted by SingleR Label") +
+  xlab("t-SNE 1") +
+  ylab("t-SNE 2")
+
+ggsave(
+  filename = file.path(plot_dir, "combined_lipo_tSNE_SingleR_HPCA_broad_separated.pdf"),
+  plot = HPCA_tSNE_separated, width = 18, height = 10
+)
+
+# Faceted UMAP plot by SingleR coarse labels
+HPCA_UMAP_separated <- DimPlot(
+  combined_lipo, 
+  group.by = "SingleR_HPCA", 
+  reduction = "umap", 
+  label = FALSE, 
+  cols = NULL
+) + facet_wrap(~ SingleR_HPCA) +
+  ggtitle("SingleR HPCA Cell Type Annotation (UMAP): Faceted by SingleR Label") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2")
+
+ggsave(
+  filename = file.path(plot_dir, "combined_lipo_UMAP_SingleR_HPCA_broad_separated.pdf"),
+  plot = HPCA_UMAP_separated, width = 18, height = 10
+)
+
+##########################################################################
+
+# Here is code that shows which seurat cluster would be labelled as which identity by SingleR - the only downside being that some clusters are very evenly matched by cell counts between identities but only the dominant one is labelled as it e.g. cluster 3 is labeled as adipocytes but is very closely matched by fibroblasts
+
+# Cross-tabulate seurat clusters and SingleR to see which label dominates each cluster
+cluster_labels <- table(Cluster = Idents(combined_lipo), Label = combined_lipo$SingleR_HPCA)
+
+# Find the most dominant identity for each cluster
+dominant_labels <- apply(cluster_labels, 1, function(x) names(which.max(x)))
+
+# Map the label to eacg seurat cluster
+combined_lipo$SingleR_cluster_annotation <- plyr::mapvalues(
+  x = as.character(Idents(combined_lipo)),      # cluster IDs
+  from = names(dominant_labels),               # cluster numbers
+  to = dominant_labels                         # corresponding SingleR labels
+)
+
+# Visualise the t-SNE with seruat clusters and SingleR labels
+OG_cluster_labels_tsne <- DimPlot(
+  combined_lipo, 
+  group.by = "SingleR_cluster_annotation", 
+  reduction = "tsne", 
+  label = TRUE, 
+  repel = TRUE, 
+  label.size = 5
+) + ggtitle("Seurat Clusters Labeled by Dominant SingleR HPCA Cell Type Identity (t-SNE)")
+
+ggsave(
+  filename = file.path(plot_dir, "combined_lipo_tSNE_SingleR_HPCA_broad_clusters_labelled.pdf"),
+  plot = OG_cluster_labels_tsne, width = 15, height = 8
+)
+
+# UMAP plot with cluster-based dominant SingleR labels
+OG_cluster_labels_umap <- DimPlot(
+  combined_lipo, 
+  group.by = "SingleR_cluster_annotation", 
+  reduction = "umap", 
+  label = TRUE, 
+  repel = TRUE,
+  label.size = 5
+) + ggtitle("Seurat Clusters Labeled by Dominant SingleR HPCA Cell Type Identity (UMAP)")
+
+ggsave(
+  filename = file.path(plot_dir, "combined_lipo_UMAP_SingleR_HPCA_broad_clusters_labelled.pdf"),
+  plot = OG_cluster_labels_umap, width = 15, height = 8
+)
+
+```
+
+```{r}
+# Check dominance of SingleR label within each Seurat cluster
+dominant_label_counts <- apply(cluster_labels, 1, max)
+ambiguous <- dominant_label_counts / rowSums(cluster_labels) < 0.6
+
+# Show ambiguous clusters (where no single label is >60% of the cells)
+print("Ambiguous clusters (<60% dominance):")
+print(names(ambiguous[ambiguous]))
+
+```
+
+```{r}
+##### Inspect coarse SingleR results #####
+
+# View how many cells are in each SingleR label
+singleR_labels_df <- as.data.frame.matrix(
+  table(Idents(combined_lipo), combined_lipo$SingleR_HPCA)
+)
+print(singleR_labels_df)
+
+write.csv(singleR_labels_df, file = file.path(plot_dir, "singleR_label_counts_by_cluster.csv"), row.names = TRUE)
+
+# View the number of cells in each SingleR label
+print(table(combined_lipo$SingleR_HPCA))
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# Long format from your wide table
+singleR_long <- singleR_labels_df %>%
+  tibble::rownames_to_column("cluster") %>%
+  pivot_longer(-cluster, names_to = "SingleR_label", values_to = "n") %>%
+  mutate(cluster = factor(cluster, levels = as.character(0:14)))  # order clusters 0-14
+
+# Stacked counts per cluster
+p_counts <- ggplot(singleR_long, aes(x = cluster, y = n, fill = SingleR_label)) +
+  geom_col() +
+  labs(title = "SingleR Label Counts Per Cluster",
+       x = "Seurat cluster", y = "Cell count", fill = "SingleR label") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+ggsave(file.path(plot_dir, "singleR_counts_per_cluster_stacked.pdf"),
+       p_counts, width = 9, height = 5)
+
+
+```
+
+```{r}
+singleR_long <- singleR_long %>%
+  mutate(cluster = factor(cluster, levels = as.character(0:14))) %>%  # order clusters
+  group_by(cluster) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+p_props <- ggplot(singleR_long, aes(x = cluster, y = prop, fill = SingleR_label)) +
+  geom_col(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Composition Of SingleR Labels Per Cluster",
+       x = "Seurat cluster", y = "Proportion", fill = "SingleR label") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(hjust = 1))
+
+ggsave(file.path(plot_dir, "singleR_composition_per_cluster_stacked_prop.pdf"),
+       p_props, width = 9, height = 5)
+
+```
+
+```{r}
+overall <- as.data.frame(table(combined_lipo$SingleR_HPCA))
+colnames(overall) <- c("SingleR_label", "n")
+overall <- overall %>%
+  arrange(desc(n)) %>%
+  mutate(prop = n / sum(n))
+
+p_overall <- ggplot(overall, aes(x = reorder(SingleR_label, -n), y = n, fill = SingleR_label)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = n), vjust = -0.3, size = 3) +
+  labs(title = "Total Count Of Each SingleR Label", x = "SingleR label", y = "Cell count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave(file.path(plot_dir, "singleR_overall_counts.pdf"),
+       p_overall, width = 9, height = 5)
+
+```
+
+```{r}
+##### Identify Top Markers Per Cluster #####
+
+# Prepare the seurat object for FindAllMarkers()
+combined_lipo <- PrepSCTFindMarkers(combined_lipo)
+
+# Identify significantly upregulated genes in each cluster
+markers_combined_lipo <- FindAllMarkers(
+  combined_lipo,
+  only.pos = TRUE,           # Only return positive markers
+  min.pct = 0.25,            # Expressed in at least 25% of cells
+  logfc.threshold = 0.25     # Log fold-change threshold
+)
+
+# Save marker gene results
+write.csv(markers_combined_lipo, file = file.path(plot_dir,"all_markers_per_cluster_post_SingleR.csv"), row.names = FALSE)
+
+# View how many marker genes were identified per cluster
+table(markers_combined_lipo$cluster)
+
+```
+
+```{r}
+##### Extract and Save the Top 10 Marker Genes per Cluster #####
+
+# Select the top 10 marker genes per cluster based on highest avg_log2FC
+top10_markers <- markers_combined_lipo %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 10)
+
+# Save the top 10 markers as a csv
+write.csv(top10_markers, file = file.path(plot_dir,"top10_markers_per_cluster_post_SingleR.csv"), row.names = FALSE)
+
+# View the top 10 markers
+print(top10_markers)
+
+# Heatmap of top markers
+top_genes <- unique(top10_markers$gene)
+heatmap <- DoHeatmap(combined_lipo, features = top_genes, group.by = "SingleR_cluster_annotation") +
+  ggtitle("Heatmap of Top 10 Marker Genes per Cluster (SingleR Annotated)")
+ggsave(file.path(plot_dir, "heatmap_top10_markers_per_cluster_post_SingleR.pdf"), heatmap, width = 15, height = 20)
+
+```
+
+Manual Annotation with Canonical Markers
+```{r}
+##### Set up plot output directory ####
+
+plot_dir <- file.path("results", "liposarcoma", "manual_plots")
+dir.create(
+  plot_dir, 
+  recursive = TRUE, 
+  showWarnings = FALSE
+  )
+
+```
+
+```{r}
+##### Load and Prepare Canonical Gene Files #####
+
+# Load csv containing differentially expressed marker genes (csv file 1)
+# Documentation of where these gene sets came from:
+marker_genes <- read.csv(
+  "literature_marker_genes_cross_referenced_to_databases.csv", 
+  header = TRUE, 
+  stringsAsFactors = FALSE
+  )
+
+# Create a function that cleans and converts each column into a named gene list
+make_marker_list <- function(df) {
+  lapply(df, function(col) {
+    genes <- trimws(col)
+    genes[genes != ""]
+  })
+}
+
+# Apply the function to marker gene file
+marker_list_lit <- make_marker_list(marker_genes)
+
+```
+
+```{r}
+##### Visualise whole-gene set association #####
+
+# Function to generate FeaturePlot for averaged marker expression
+average_marker_plot <- function(seur_obj, gene_vector, label, reduction = "umap", global_min = NULL, global_max = NULL) {
+  valid_genes <- gene_vector[gene_vector %in% rownames(seur_obj)]
+  if (length(valid_genes) == 0) {
+    message("Skipping ", label, " – no valid genes found.")
+    return(NULL)
+  }
+
+  # Compute average expression
+  seur_obj$AvgExpr <- rowMeans(FetchData(seur_obj, vars = valid_genes))
+
+  # Create plot with fixed color scale
+  FeaturePlot(
+    seur_obj,
+    features = "AvgExpr",
+    reduction = reduction,
+    min.cutoff = global_min,
+    max.cutoff = global_max
+  ) +
+    scale_colour_gradientn(
+      colours = c("lightgrey", "blue", "red"),
+      limits = c(global_min, global_max),
+      oob = scales::squish
+    ) +
+    ggtitle(paste(label, "-", reduction, "average expression"))
+}
+
+# Function to generate violin plots
+generate_violin_plots <- function(seur_obj, gene_vector, group.by = "seurat_clusters") {
+  valid_genes <- gene_vector[gene_vector %in% rownames(seur_obj)]
+  if (length(valid_genes) == 0) {
+    message("No valid genes found for violin plot")
+    return(NULL)
+  }
+  plots <- lapply(valid_genes, function(gene) {
+    VlnPlot(seur_obj, features = gene, group.by = group.by, pt.size = 0) +
+      ggtitle(gene) + NoLegend()
+  })
+  pages <- split(plots, ceiling(seq_along(plots) / 9))
+  return(pages)
+}
+
+# Function to generate dot plots
+generate_dot_plot <- function(seur_obj, gene_vector, label, group.by = "seurat_clusters") {
+  valid_genes <- unique(gene_vector[gene_vector %in% rownames(seur_obj)])  # remove duplicates
+  if (length(valid_genes) == 0) {
+    message("Skipping dot plot for ", label, " – no valid genes found.")
+    return(NULL)
+  }
+  DotPlot(seur_obj, features = valid_genes, group.by = group.by) +
+    RotatedAxis() +
+    ggtitle(paste("Dot Plot -", label))
+}
+
+
+# Function to save marker plots to PDF
+save_marker_plots <- function(seur_obj, marker_list, filename, plot_type = c("average", "violin", "dot"), reduction = "umap") {
+  plot_type <- match.arg(plot_type)
+  out_path <- file.path(plot_dir, filename)
+  dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
+
+  # Compute global min/max for average expression plots
+  if (plot_type == "average") {
+    all_avg_expr <- unlist(lapply(marker_list, function(gene_vector) {
+      valid_genes <- gene_vector[gene_vector %in% rownames(seur_obj)]
+      if (length(valid_genes) > 0) {
+        rowMeans(FetchData(seur_obj, vars = valid_genes))
+      } else {
+        NULL
+      }
+    }))
+    global_min <- floor(min(all_avg_expr, na.rm = TRUE))
+    global_max <- 3
+  }
+
+  pdf(out_path, width = 10, height = ifelse(plot_type == "violin", 10, 7))
+
+  for (label in names(marker_list)) {
+    gene_vector <- marker_list[[label]]
+    if (plot_type == "average") {
+      p <- average_marker_plot(seur_obj, gene_vector, label, reduction, global_min, global_max)
+      if (!is.null(p)) print(p)
+    } else if (plot_type == "violin") {
+      pages <- generate_violin_plots(seur_obj, gene_vector)
+      if (!is.null(pages)) for (page in pages) print(wrap_plots(page, ncol = 3))
+    } else if (plot_type == "dot") {
+      p <- generate_dot_plot(seur_obj, gene_vector, label)
+      if (!is.null(p)) print(p)
+    }
+  }
+
+  dev.off()
+}
+
+# Function to save individual FeaturePlots per gene
+save_individual_featureplots <- function(seur_obj, marker_list, out_dir = plot_dir, reduction = "umap") {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  for (celltype in names(marker_list)) {
+    pdf(file.path(out_dir, paste0("FeaturePlots_", celltype, ".pdf")), width = 7, height = 6)
+    for (gene in marker_list[[celltype]]) {
+      if (gene %in% rownames(seur_obj)) {
+        p <- FeaturePlot(seur_obj, features = gene, reduction = reduction, label = TRUE) +
+          ggtitle(paste(celltype, "Marker:", gene))
+        print(p)
+      }
+    }
+    dev.off()
+  }
+}
+
+```
+
+```{r}
+##### Create and Save Plots #####
+
+### Marker plots
+save_marker_plots(combined_lipo, marker_list_lit, "marker_sets_DE_umap.pdf", plot_type = "average", reduction = "umap")
+save_marker_plots(combined_lipo, marker_list_lit, "marker_sets_DE_tsne.pdf", plot_type = "average", reduction = "tsne")
+save_marker_plots(combined_lipo, marker_list_lit, "marker_sets_DE_violin.pdf", plot_type = "violin")
+save_marker_plots(combined_lipo, marker_list_lit, "marker_sets_DE_dot.pdf", plot_type = "dot")
+
+```
+
+```{r}
+##### Singular Violin Plot of Average Gene Set Expression per Cluster #####
+
+# For each gene set (column), compute average expression per cell and store in metadata
+for (label in names(marker_list_lit)) {
+  gene_vector <- marker_list_lit[[label]]
+  valid_genes <- gene_vector[gene_vector %in% rownames(combined_lipo)]
+  if (length(valid_genes) > 0) {
+    avg_expr <- rowMeans(FetchData(combined_lipo, vars = valid_genes))
+    combined_lipo[[paste0("AvgExpr_", label)]] <- avg_expr
+  } else {
+    message("No valid genes found for ", label)
+  }
+}
+
+# Melt average expression scores into long format for ggplot2 violin plot
+avg_expr_df <- combined_lipo@meta.data %>%
+  dplyr::select(seurat_clusters, starts_with("AvgExpr_")) %>%
+  tidyr::pivot_longer(cols = starts_with("AvgExpr_"), 
+                      names_to = "Gene_Set", 
+                      values_to = "Avg_Expression") %>%
+  dplyr::mutate(Gene_Set = gsub("AvgExpr_", "", Gene_Set))
+
+# Create the violin plot
+violin_summary_plot <- ggplot(avg_expr_df, aes(x = seurat_clusters, y = Avg_Expression, fill = Gene_Set)) +
+  geom_violin(scale = "width", adjust = 1) +
+  facet_wrap(~ Gene_Set, scales = "free_y", ncol = 3) +
+  theme_minimal() +
+  labs(
+    title = "Violin Plot of Average Expression for Each Marker Gene Set",
+    x = "Seurat Cluster",
+    y = "Average Expression"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+# Save to file
+ggsave(
+  filename = file.path(plot_dir, "violinplot_average_expression_per_cluster.pdf"),
+  plot = violin_summary_plot,
+  width = 12, height = 8
+)
+
+```
+
+```{r}
+##### Define Manual Labels Based On Canonical Markers #####
+
+# Manually determine the cell type for each seurat cluster
+manual_cluster_labels <- c(
+  "0" = "CD4+ T-Cells",
+  "1" = "Capillary Endothelial Cells",
+  "2" = "DDLPS",
+  "3" = "DDLPS",
+  "4" = "DDLPS",
+  "5" = "Capillary Endothelial Cells",
+  "6" = "Venous Endothelial Cells",
+  "7" = "NK Cells",
+  "8" = "Neutrophils and M1 Macrophages",
+  "9" = "Smooth Muscle Cells",
+  "10" = "CD8+ T-Cells",
+  "11" = "M2 Macrophages",
+  "12" = "Tumour-Associated Cells",
+  "13" = "Arterial Endothelial Cells",
+  "14" = "B Cells"
+)
+
+```
+
+```{r}
+##### Store manual labels in the metadata #####
+
+# Convert cluster IDs to characters and save to metadata
+combined_lipo$manual_annotation <- plyr::mapvalues(
+  x = as.character(combined_lipo$seurat_clusters),
+  from = names(manual_cluster_labels),
+  to = manual_cluster_labels
+)
+
+# Create a dataframe that maps each seurat cluster number to its manually assigned label
+manual_mapping_df <- data.frame(
+  cluster = names(manual_cluster_labels),
+  manual_label = manual_cluster_labels
+)
+
+# Save dataframe as a csv file
+write.csv(manual_mapping_df, file = file.path(plot_dir, "manual_cluster_labels.csv"), row.names = FALSE)
+
+# Export complete metadata table for all cells
+write.csv(combined_lipo@meta.data, file = file.path(plot_dir, "combined_lipo_metadata_with_manual_annotation.csv"))
+
+```
+
+```{r}
+##### Visualise Manual Labels #####
+
+# UMAP with manual annotations
+manual_umap <- DimPlot(
+  combined_lipo,
+  group.by = "manual_annotation",
+  reduction = "umap",
+  label = TRUE,
+  repel = TRUE
+) + ggtitle("Manual Cell Type Annotation (UMAP)") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2")
+
+ggsave(
+  filename = file.path(plot_dir, "combined_lipo_UMAP_manual_annotation.pdf"),
+  plot = manual_umap,
+  width = 12,
+  height = 8
+)
+
+# t-SNE with manual annotations
+manual_tsne <- DimPlot(
+  combined_lipo,
+  group.by = "manual_annotation",
+  reduction = "tsne",
+  label = TRUE,
+  repel = TRUE
+) + ggtitle("Manual Cell Type Annotation (t-SNE)") +
+  xlab("t-SNE 1") +
+  ylab("t-SNE 2")
+
+ggsave(
+  filename = file.path(plot_dir, "combined_lipo_tSNE_manual_annotation.pdf"),
+  plot = manual_tsne,
+  width = 12,
+  height = 8
+)
+
+```
+
+```{r}
+##### Heatmaps of Top Markers #####
+
+# Deduplicate literature-derived gene list
+top10_genes <- unique(unlist(marker_list_lit))
+
+# Filter to only include genes present in the seurat object
+top10_genes <- top10_genes[top10_genes %in% rownames(combined_lipo)]
+
+# Generate a heatmap of the filtered literature marker genes
+heatmap <- DoHeatmap(
+  combined_lipo, 
+  features = top10_genes, 
+  group.by = "manual_annotation"
+) +
+  ggtitle("Heatmap of Literature Marker Genes by Manual Annotation") +
+  theme(
+    axis.text.y = element_text(size = 6),   # smaller gene labels
+    plot.title  = element_text(size = 18, face = "bold") # bigger title
+  )
+
+# Save heatmap
+ggsave(file.path(
+  plot_dir, 
+  "heatmap_marker_genes_manual_annotation.pdf"), 
+  heatmap, 
+  width = 15, 
+  height = 25
+  )
+
+```
+Saving everything above to be used at a later date without rerunning
+```{r}
+##### Save Final Seurat Object #####
+if("manual_annotation" %in% colnames(combined_lipo@meta.data)){
+  saveRDS(combined_lipo, "results/liposarcoma/combined_lipo_annotated.rds")
+  message("✅ Saved Seurat object with manual annotations")
+} else {
+  warning("Manual annotation not found in metadata – object not saved")
+}
+
+
+# Define the path where you want to save the file
+saveRDS(combined_lipo, file = file.path(plot_dir, "combined_lipo_annotated.rds"))
+
+```
+SingleR vs Manual Annotation
+```{r}
+if (!requireNamespace("ggalluvial", quietly = TRUE)) install.packages("ggalluvial")
+library(ggalluvial)
+
+# 1) Build a contingency table of Manual vs SingleR labels
+cm <- table(
+  Manual  = combined_lipo$manual_annotation,
+  SingleR = combined_lipo$SingleR_HPCA,
+  useNA   = "no"
+)
+
+# 2) Convert to long data.frame and keep positive flows
+flow_df <- as.data.frame(cm) %>%
+  dplyr::filter(Freq > 0) %>%
+  dplyr::rename(manual = Manual, singleR = SingleR)
+
+# 3) (Optional) order strata by total size for cleaner display
+manual_order  <- names(sort(rowSums(cm), decreasing = TRUE))
+singleR_order <- names(sort(colSums(cm), decreasing = TRUE))
+flow_df$manual  <- factor(flow_df$manual,  levels = manual_order)
+flow_df$singleR <- factor(flow_df$singleR, levels = singleR_order)
+p_alluvial <- ggplot(
+  flow_df,
+  aes(axis1 = manual, axis2 = singleR, y = Freq)
+) +
+  geom_alluvium(aes(fill = manual), alpha = 0.7) +
+  geom_stratum(width = 0.2) +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3) +
+  scale_x_discrete(limits = c("Manual annotation", "SingleR label"),
+                   expand = c(.15, .05)) +
+  labs(
+    title = "Flow from Manual Annotation to SingleR Label",
+    x = NULL, y = "Cell count"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5))
+
+ggsave(
+  filename = file.path(plot_dir, "manual_vs_SingleR_alluvial.pdf"),
+  plot = p_alluvial,
+  width = 14, height = 8
+)
+
+```
+
+Loading the saved object
+```{r}
+##### Load the Saved Seurat Object #####
+
+combined_lipo <- readRDS("results/liposarcoma/combined_lipo_annotated.rds")
+
+# Check UMAP/tSNE still exists
+Reductions(combined_lipo)  # Should list "umap", "tsne", etc.
+head(colnames(combined_lipo@meta.data))  # Should list manual_annotation etc.
+
+```
+
+
+Tumour vs Non-Tumour Discrimination
+```{r}
+##### Set up plot output directory ####
+
+plot_dir <- file.path("results", "liposarcoma", "ploidy_plots")
+dir.create(
+  plot_dir, 
+  recursive = TRUE, 
+  showWarnings = FALSE
+  )
+
+```
+
+```{r}
+##### Extract Raw Counts and Filter MT Genes #####
+
+# Extract raw, non-normalised RNA count matrix
+raw_counts <- GetAssayData(
+  combined_lipo, 
+  assay = "RNA", 
+  slot = "counts"
+  )
+
+# Remove mitochondrial genes
+raw_counts <- raw_counts[!grepl("^MT-", rownames(raw_counts)), ]
+
+
+
+```
+
+```{r}
+##### Run CopyKAT to Detect Aneuploidy #####
+
+# Configure R graphics
+options(bitmapType = "cairo")
+
+set.seed(654)
+
+# Run CopyKAT on all cells
+copykat_result <- copykat(
+  rawmat = raw_counts,
+  id.type = "S",                     
+  ngene.chr = 5,
+  win.size = 25,
+  norm.cell.names = NULL,           
+  output.seg = FALSE
+)
+
+```
+
+```{r}
+##### Integrate CopyKAT Predictions into Seurat #####
+
+# Extract prediction labels
+copykat_labels <- copykat_result$prediction
+
+# Fix CopyKAT cell names to match Seurat (from .1 to -1)
+rownames(copykat_labels) <- gsub("\\.1$", "-1", rownames(copykat_labels))
+
+# Initialise a vector of NAs for all cells to safely assign predictions
+copykat_pred <- rep(NA, ncol(combined_lipo))
+names(copykat_pred) <- colnames(combined_lipo)
+
+# Fill in predictions for matching cells only 
+matched_cells <- intersect(rownames(copykat_labels), colnames(combined_lipo))
+copykat_pred[matched_cells] <- copykat_labels[matched_cells, "copykat.pred"]
+
+```
+
+```{r}
+##### Store ploidy labels in the metadata #####
+
+# Add CopyKAT labels to metadata
+combined_lipo$tumour_prediction <- copykat_pred
+
+# Translate ploidy labels to biological terms
+combined_lipo$tumour_status <- dplyr::recode(
+  combined_lipo$tumour_prediction,
+  "aneuploid" = "Tumour",
+  "diploid" = "Non-Tumour"
+)
+
+library(tidyr)
+
+combined_lipo$tumour_status <- replace_na(combined_lipo$tumour_status, "Uncertain")
+
+combined_lipo$tumour_status <- factor(
+  combined_lipo$tumour_status, 
+  levels = c("Tumour", "Non-Tumour", "Uncertain")
+)
+
+# Total summary: number of Tumour/Non-Tumour/Uncertain cells
+status_counts <- as.data.frame(table(combined_lipo$tumour_status))
+colnames(status_counts) <- c("Tumour_Status", "Cell_Count")
+print(status_counts)
+
+# Summary table of counts
+write.csv(
+  status_counts,
+  file = file.path(plot_dir, "tumour_status_summary.csv"),
+  row.names = FALSE
+)
+
+# Cluster summary: number of each status per cluster
+cluster_status_counts <- as.data.frame(
+  combined_lipo@meta.data %>%
+    dplyr::group_by(cluster = Idents(combined_lipo), tumour_status) %>%
+    dplyr::summarise(Cell_Count = n(), .groups = "drop")
+)
+
+write.csv(
+  cluster_status_counts,
+  file = file.path(plot_dir, "tumour_status_by_cluster.csv"),
+  row.names = FALSE
+)
+print(cluster_status_counts)
+
+```
+
+```{r}
+##### Visualise Ploidy Labels #####
+
+# Plot UMAP
+ploidy_umap <- DimPlot(
+  combined_lipo, 
+  group.by = "tumour_status", 
+  reduction = "umap", 
+  label = TRUE, 
+  repel = TRUE) +
+  ggtitle("Distirbution Of Anuploid/Diploid Populations From CopyKAT Algorithm (UMAP)") +
+  xlab("UMAP 1") + 
+  ylab("UMAP 2")
+
+ggsave(file.path(plot_dir, "UMAP_tumour_vs_non_tumour_CopyKAT.pdf"), plot = ploidy_umap, width = 12, height = 8)
+
+# Plot t-SNE
+ploidy_tsne <- DimPlot(
+  combined_lipo, 
+  group.by = "tumour_status", 
+  reduction = "tsne", 
+  label = TRUE, 
+  repel = TRUE) +
+  ggtitle("Distirbution Of Anuploid/Diploid Populations From CopyKAT Algorithm (t-SNE)") +
+  xlab("t-SNE 1") +
+  ylab("t-SNE 2")
+
+ggsave(file.path(plot_dir, "tSNE_tumour_vs_non_tumour_CopyKAT.pdf"), plot = ploidy_tsne, width = 12, height = 8)
+
+```
+
+```{r}
+##### Subset aneuploid and diploid labels #####
+
+# Subset tumour cells
+tumour_cells <- colnames(combined_lipo)[combined_lipo$tumour_status == "Tumour"]
+seurat_tumour <- subset(combined_lipo, cells = tumour_cells)
+
+#Subset non-tumour cells
+nontumour_cells <- colnames(combined_lipo)[combined_lipo$tumour_status == "Non-Tumour"]
+seurat_nontumour <- subset(combined_lipo, cells = nontumour_cells)
+
+```
+
+```{r}
+##### Export CopyKAT Predictions #####
+
+# Save individual predictions and statuses for all cells
+copykat_output <- data.frame(
+  Cell = names(copykat_pred),
+  CopyKAT_Label = copykat_pred,
+  Tumour_Status = combined_lipo$tumour_status
+)
+
+write.csv(copykat_output, file = file.path(plot_dir, "copykat_predictions.csv"), row.names = FALSE)
+
+```
+
+```{r}
+##### Calculate percentage of tumour cells per sample #####
+
+# Choose sample column dynamically
+sample_col <- if("sample" %in% colnames(combined_lipo@meta.data)) {
+  "sample"
+} else if("orig.ident" %in% colnames(combined_lipo@meta.data)) {
+  "orig.ident"
+} else {
+  stop("No sample column found in metadata. Please add one before running this step.")
+}
+
+# Group by sample and tumour status
+sample_status_counts <- combined_lipo@meta.data %>%
+  dplyr::group_by(.data[[sample_col]], tumour_status) %>%
+  dplyr::summarise(Cell_Count = n(), .groups = "drop")
+
+# Calculate total cells per sample
+sample_totals <- combined_lipo@meta.data %>%
+  dplyr::group_by(.data[[sample_col]]) %>%
+  dplyr::summarise(Total_Cells = n(), .groups = "drop")
+
+# Perform join using proper dynamic column reference
+sample_status_percent <- sample_status_counts %>%
+  dplyr::left_join(sample_totals, by = sample_col) %>%
+  dplyr::mutate(Percentage = round((Cell_Count / Total_Cells) * 100, 2))
+
+# Save to CSV
+write.csv(
+  sample_status_percent,
+  file = file.path(plot_dir, "tumour_percentage_by_sample.csv"),
+  row.names = FALSE
+)
+
+print(sample_status_percent)
+
+
+```
+
+```{r}
+##### Bar chart: Tumour vs Non-Tumour percentage per sample #####
+
+library(ggplot2)
+
+# Ensure plot directory exists
+barplot_path <- file.path(plot_dir, "tumour_percentage_barplot.pdf")
+
+# Detect correct sample column
+sample_col <- if("sample" %in% colnames(sample_status_percent)) {
+  "sample"
+} else if("orig.ident" %in% colnames(sample_status_percent)) {
+  "orig.ident"
+} else {
+  stop("No sample column found in data for plotting.")
+}
+
+# Create stacked bar chart
+ggplot(sample_status_percent, aes(x = .data[[sample_col]], y = Percentage, fill = tumour_status)) +
+  geom_bar(stat = "identity", width = 0.7) +
+  labs(
+    title = "Tumour vs Non-Tumour Cells per Sample",
+    x = "Sample ID",
+    y = "Percentage of Cells",
+    fill = "Tumour Status"
+  ) +
+  theme_minimal(base_size = 12) +
+  scale_fill_manual(values = c("Tumour" = "#E74C3C", 
+                               "Non-Tumour" = "#3498DB", 
+                               "Uncertain" = "grey70")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Save plot
+ggsave(barplot_path, width = 10, height = 6)
+
+
+```
+
+
+```{r}
+saveRDS(combined_lipo, file = file.path(plot_dir, "combined_lipo_basic_copykat.rds"))
+```
+
+GSEA of Major Lineages
+```{r}
+combined_lipo <- readRDS("results/liposarcoma/ploidy_plots/combined_lipo_basic_copykat.rds")
+```
+
+```{r}
+##### Set up plot output directory ####
+
+plot_dir <- file.path("results", "liposarcoma", "gsea_plots")
+dir.create(
+  plot_dir, 
+  recursive = TRUE, 
+  showWarnings = FALSE
+  )
+
+```
+
+```{r}
+##### Signed Average Marker Score #####
+
+# Function to compute signed average expression
+compute_signed_average <- function(seur_obj, up_genes, down_genes, label) {
+  # Filter for genes present in Seurat object
+  up_genes_valid <- up_genes[up_genes %in% rownames(seur_obj)]
+  down_genes_valid <- down_genes[down_genes %in% rownames(seur_obj)]
+  
+  # Warn if no genes found
+  if (length(up_genes_valid) == 0 & length(down_genes_valid) == 0) {
+    message("No valid genes found for ", label)
+    return(seur_obj)
+  }
+
+  # Fetch data
+  up_expr <- if (length(up_genes_valid) > 0) {
+    rowMeans(FetchData(seur_obj, vars = up_genes_valid))
+  } else {
+    0
+  }
+  
+  down_expr <- if (length(down_genes_valid) > 0) {
+    rowMeans(FetchData(seur_obj, vars = down_genes_valid))
+  } else {
+    0
+  }
+
+  # Compute signed average score
+  signed_score <- up_expr - down_expr
+  
+  # Store in metadata
+  seur_obj[[paste0("SignedAvg_", label)]] <- signed_score
+  return(seur_obj)
+}
+
+```
+
+```{r}
+##### Extract UMAP Coordinates For Tumour Clusters #####
+tumour_umap_coords <- Embeddings(combined_lipo, "umap")
+
+# Define bounding box for region of interest (adjust as needed)
+tumour_cells <- rownames(tumour_umap_coords[
+  tumour_umap_coords[, "umap_1"] > -2.5 & tumour_umap_coords[, "umap_1"] < 10 &
+  tumour_umap_coords[, "umap_2"] > -10 & tumour_umap_coords[, "umap_2"] < 1,
+])
+
+# Remove cells in cluster 9
+tumour_cells <- tumour_cells[!combined_lipo$seurat_clusters[tumour_cells] %in% c("9")]
+
+subset_tumour_region <- subset(combined_lipo, cells = tumour_cells)
+
+subset_tumour_region[["umap"]] <- CreateDimReducObject(
+  embeddings = tumour_umap_coords[tumour_cells, ],
+  key = "UMAP_",
+  assay = DefaultAssay(combined_lipo)
+)
+
+tumour_subset_umap <- DimPlot(subset_tumour_region, reduction = "umap", label = TRUE, label.size = 6) +
+  ggtitle("Subsetted Tumour Clusters, With Cluster 12") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2")
+ggsave(file = file.path(plot_dir, "umap_tumour_subset.pdf"), plot = tumour_subset_umap, width = 12, height = 8)
+
+subset_tumour_region <- SCTransform(
+  subset_tumour_region,
+  assay = "RNA",
+  new.assay.name = "SCT",
+  vars.to.regress = c("percent.mt", "nCount_RNA"),
+  verbose = TRUE
+)
+
+DefaultAssay(subset_tumour_region) <- "SCT"
+subset_tumour_region <- PrepSCTFindMarkers(subset_tumour_region)
+
+# Identify upregulated markers for each cluster (1 vs All Approach)
+upregulated_tumour_markers <- FindAllMarkers(
+  subset_tumour_region,
+  only.pos = TRUE,
+  logfc.threshold = 0.25,
+  min.pct = 0.25,
+  assay = "SCT"
+)
+
+# Top 20 upregulated by average log2FC
+top20_upreg_tumour_markers <- upregulated_tumour_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 20)
+
+View(top20_upreg_tumour_markers)
+
+write.csv(
+  top20_upreg_tumour_markers,
+  file = file.path(plot_dir,"top20_upreg_markers_per_tumour_subcluster.csv"),
+  row.names = FALSE
+)
+
+# Identify upregulated markers for each cluster (1 vs All Approach)
+downregulated_tumour_markers <- FindAllMarkers(
+  subset_tumour_region,
+  only.neg = TRUE,
+  logfc.threshold = 0.25,
+  min.pct = 0.25,
+  assay = "SCT"
+)
+
+# Top 20 downregulated by average log2FC
+top20_downreg_tumour_markers <- downregulated_tumour_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 20)
+
+View(top20_downreg_tumour_markers)
+
+write.csv(
+  top20_downreg_tumour_markers,
+  file = file.path(plot_dir,"top20_downreg_markers_per_tumour_subcluster.csv"),
+  row.names = FALSE
+)
+
+# WDLPS marker set
+WDLPS_up_genes <- c("MDM2", "CDK4", "HMGA2", "JUN", "FRS2", "E2F1", "CDKN2A", "INSM1", "MLLT10", "MLL", "NEBL", "BMI1", "P16", "TSPAN31", "YEATS4", "CPM")         # upregulated in LPS subtype
+WDLPS_down_genes <- c("RUNX3", "ARID1A", "ATM", "CHEK1", "MIR15A", "MIR16-1", "SORBS1", "KRT8", "MT1G", "CEBPA", "PPARG", "DOG1", "S100")        # downregulated in LPS subtype
+
+# Compute signed average
+subset_tumour_region <- compute_signed_average(subset_tumour_region, WDLPS_up_genes, WDLPS_down_genes, label = "WDLPS_signature")
+
+# Visualise
+WDLPS_features <- FeaturePlot(
+  subset_tumour_region,
+  features = "SignedAvg_WDLPS_signature",
+  reduction = "umap"
+) +
+  scale_color_gradient2(
+    low = "blue",       # Downregulated
+    mid = "lightgrey",  # Neutral
+    high = "red",       # Upregulated
+    midpoint = 0        # Center the color scale at 0
+  ) +
+  ggtitle("Signed Average WDLPS Signature Score")
+
+ggsave(file.path(plot_dir, "tumour_WDLPS_features.pdf"), WDLPS_features, width = 8, height = 5)
+
+# DDLPS marker set
+DDLPS_up_genes <- c("MDM2", "CDK4", "HMGA2", "JUN", "TSPAN31", "YEATS4", "CPM", "FRS2", "E2F1", "CDKN2A", "INSM1", "ASK1", "DDR2", "ERBB3", "STAT6", "FGFR1", "MAP3K5", "LGR5", "MCL1", "CALR", "AQP7", "ACACB", "FZD4", "GPD1", "LEP", "ROS1", "APP", "CDK1", "PCNA", "TKT", "CDC20", "BUB1B", "BARD1", "ADRB2", "LGALS3", "CAV1", "CCNA2", "CRT", "CD47", "SIAH2", "ATRX", "DAXX", "CENPF", "FGFR1", "FGFR2", "FGFR3", "FGFR4", "FRS2", "CD34", "P16")         # upregulated in LPS subtype
+DDLPS_down_genes <- c("RUNX3", "ARID1A", "ATM", "CHEK1", "MIR15A", "MIR16-1", "SORBS1", "KRT8", "MT1G", "CEBPA", "PPARG", "DOG1", "S100")        # downregulated in LPS subtype
+
+# Compute signed average
+subset_tumour_region <- compute_signed_average(subset_tumour_region, DDLPS_up_genes, DDLPS_down_genes, label = "DDLPS_signature")
+
+# Visualise
+DDLPS_features <- FeaturePlot(
+  subset_tumour_region,
+  features = "SignedAvg_DDLPS_signature",
+  reduction = "umap"
+) +
+  scale_color_gradient2(
+    low = "blue",       # Downregulated
+    mid = "lightgrey",  # Neutral
+    high = "red",       # Upregulated
+    midpoint = 0        # Center the color scale at 0
+  ) +
+  ggtitle("Signed Average DDLPS Signature Score")
+
+ggsave(file.path(plot_dir, "tumour_DDLPS_features.pdf"), DDLPS_features, width = 8, height = 5)
+
+# MLPS marker set
+MLPS_up_genes <- c("FUS-CHOP", "EWS-CHOP", "MET", "RET", "IGFR", "AXL", "EGFR", "VEGFR2", "PIK3CA", "C228T", "C250T", "TERT", "ATRX", "DAXX", "CTAG1B", "CTAG2", "MAGEA9", "PRAME", "CHSY1", "STAT6")         # upregulated in LPS subtype
+MLPS_down_genes <- c("PTEN", "EFEMP1", "THBS2", "MDM2", "CDK4", "HMGA2", "TSPAN31")        # downregulated in LPS subtype
+
+# Compute signed average
+subset_tumour_region <- compute_signed_average(subset_tumour_region, MLPS_up_genes, MLPS_down_genes, label = "MLPS_signature")
+
+# Visualise
+MLPS_features <- FeaturePlot(
+  subset_tumour_region,
+  features = "SignedAvg_MLPS_signature",
+  reduction = "umap"
+) +
+  scale_color_gradient2(
+    low = "blue",       # Downregulated
+    mid = "lightgrey",  # Neutral
+    high = "red",       # Upregulated
+    midpoint = 0        # Center the color scale at 0
+  ) +
+  ggtitle("Signed Average MLPS Signature Score")
+
+ggsave(file.path(plot_dir, "tumour_MLPS_features.pdf"), MLPS_features, width = 8, height = 5)
+
+# PLPS marker set
+PLPS_up_genes <- c("TP53", "PPARG", "BCL2", "VEGF", "MMP2", "CEBPA")         # upregulated in LPS subtype
+PLPS_down_genes <- c("NF1", "CEBPA", "EP300", "RB1", "TP53")        # downregulated in LPS subtype
+
+# Compute signed average
+subset_tumour_region <- compute_signed_average(subset_tumour_region, PLPS_up_genes, PLPS_down_genes, label = "PLPS_signature")
+
+# Visualise
+PLPS_features <- FeaturePlot(
+  subset_tumour_region,
+  features = "SignedAvg_PLPS_signature",
+  reduction = "umap"
+) +
+  scale_color_gradient2(
+    low = "blue",       # Downregulated
+    mid = "lightgrey",  # Neutral
+    high = "red",       # Upregulated
+    midpoint = 0        # Center the color scale at 0
+  ) +
+  ggtitle("Signed Average PLPS Signature Score")
+
+ggsave(file.path(plot_dir, "tumour_PLPS_features.pdf"), PLPS_features, width = 8, height = 5)
+
+# MPLPS marker set
+#MPLPS_down_genes <- c("RB1")        # downregulated in LPS subtype
+
+# Compute signed average
+#subset_tumour_region <- compute_signed_average(subset_tumour_region, MPLPS_up_genes, MPLPS_down_genes, label = "MPLPS_signature")
+
+# Visualise
+#MPLPS_features <- FeaturePlot(
+  #subset_tumour_region,
+  #features = "SignedAvg_MPLPS_signature",
+  #reduction = "umap"
+#) +
+ # scale_color_gradient2(
+  #  low = "blue",       # Downregulated
+   # mid = "lightgrey",  # Neutral
+    #high = "red",       # Upregulated
+    #midpoint = 0        # Center the color scale at 0
+#  ) +
+ # ggtitle("Signed Average MPLPS Signature Score")
+
+#ggsave(file.path(plot_dir, "tumour_MPLPS_features.pdf"), MPLPS_features, width = 8, height = 5)
+
+```
+
+```{r}
+# Set cluster identities (if not already set)
+Idents(subset_tumour_region) <- "seurat_clusters"
+
+# Define your subtype mapping
+subtype_labels <- c(
+  "2"  = "DDLPS",
+  "3"  = "DDLPS",
+  "4" = "DDLPS",
+  "12" = "DDLPS"
+)
+
+# Add subtype labels to metadata
+subset_tumour_region$tumour_subtype_label <- plyr::mapvalues(
+  x = as.character(subset_tumour_region$seurat_clusters),
+  from = names(subtype_labels),
+  to = subtype_labels,
+  warn_missing = FALSE
+)
+
+# Set NA for unlabeled clusters
+subset_tumour_region$tumour_subtype_label[is.na(subset_tumour_region$tumour_subtype_label)] <- "Unlabelled"
+
+# Confirm label distribution
+table(subset_tumour_region$tumour_subtype_label)
+
+```
+
+```{r}
+# 1. Prepare Hallmark gene sets
+msig_h_df <- msigdbr(species = "Homo sapiens", collection = "H") %>%
+  dplyr::select(gs_name, ncbi_gene)
+
+# 2. Set identities (if not already set)
+Idents(subset_tumour_region) <- "seurat_clusters"
+
+# 3. Choose a tumour cluster (e.g., "0", "1", etc.)
+# You can check available clusters with:
+print(levels(Idents(subset_tumour_region)))
+
+# Define the cluster to analyse
+target_cluster <- "3"  # change this to your desired tumour subcluster
+
+# 4. Get DEGs for this cluster vs all others
+deg <- FindMarkers(
+  subset_tumour_region,
+  ident.1 = target_cluster,
+  only.pos = FALSE,
+  logfc.threshold = 0,
+  min.pct = 0.05
+)
+
+# Add gene symbols to a column
+deg$gene <- rownames(deg)
+length(deg$gene)
+
+# 5. Map gene symbols to ENTREZ IDs
+deg_mapped <- bitr(
+  deg$gene,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+) %>%
+  inner_join(deg, by = c("SYMBOL" = "gene"))
+
+nrow(deg_mapped)
+
+# 6. Prepare ranked gene list
+gene_list <- deg_mapped %>%
+  arrange(desc(avg_log2FC)) %>%
+  distinct(ENTREZID, .keep_all = TRUE) %>%
+  pull(avg_log2FC)
+names(gene_list) <- deg_mapped$ENTREZID
+
+# 7. Run GSEA
+gsea_res <- GSEA(
+  geneList = gene_list,
+  TERM2GENE = msig_h_df,
+  pvalueCutoff = 0.05,
+  verbose = TRUE,
+  minGSSize = 10,          
+  maxGSSize = 1000,          
+  nPermSimple = 10000 
+)
+
+# 8. Save results
+write.csv(
+  gsea_res@result,
+  file = file.path(plot_dir, paste0("GSEA_tumour_cluster_", target_cluster, ".csv")),
+  row.names = FALSE
+)
+
+if (!requireNamespace("enrichplot", quietly = TRUE)) BiocManager::install("enrichplot")
+library(enrichplot)
+
+# 9. Plot top enriched pathways
+pdf(file.path(plot_dir, paste0("GSEA_dotplot_cluster_", target_cluster, ".pdf")), width = 10, height = 6)
+dotplot(gsea_res, showCategory = 15, title = paste("GSEA: Tumour Cluster", target_cluster))
+dev.off()
+
+```
+
+```{r}
+##### Extract UMAP Coordinates For Tumour Clusters #####
+endo_umap_coords <- Embeddings(combined_lipo, "umap")
+
+# Define bounding box for region of interest (adjust as needed)
+endo_cells <- rownames(endo_umap_coords[
+  endo_umap_coords[, "umap_1"] > 5 & endo_umap_coords[, "umap_1"] < 12.5 &
+  endo_umap_coords[, "umap_2"] > 2 & endo_umap_coords[, "umap_2"] < 12.5,
+])
+
+# Remove cells in clusters 3 and 12
+endo_cells <- endo_cells[!combined_lipo$seurat_clusters[endo_cells] %in% c("3", "12")]
+
+subset_endo_region <- subset(combined_lipo, cells = endo_cells)
+
+subset_endo_region[["umap"]] <- CreateDimReducObject(
+  embeddings = endo_umap_coords[endo_cells, ],
+  key = "UMAP_",
+  assay = DefaultAssay(combined_lipo)
+)
+
+umap_endo_subset <- DimPlot(subset_endo_region, reduction = "umap", label = TRUE, label.size = 6) +
+  ggtitle("Subclustered Endothelial Cells on Original UMAP Coordinates") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2")
+ggsave(file = file.path(plot_dir, "umap_endo_subset.pdf"), plot = umap_endo_subset, width = 12, height = 8)
+
+subset_endo_region <- SCTransform(
+  subset_endo_region,
+  assay = "RNA",
+  new.assay.name = "SCT",
+  vars.to.regress = c("percent.mt", "nCount_RNA"),
+  verbose = TRUE
+)
+
+DefaultAssay(subset_endo_region) <- "SCT"
+subset_endo_region <- PrepSCTFindMarkers(subset_endo_region)
+
+# Identify upregulated markers for each cluster (1 vs All Approach)
+upregulated_endo_markers <- FindAllMarkers(
+  subset_endo_region,
+  only.pos = TRUE,
+  logfc.threshold = 0.25,
+  min.pct = 0.25,
+  assay = "SCT"
+)
+
+# Top 20 upregulated by average log2FC
+top20_upreg_endo_markers <- upregulated_endo_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 20)
+
+View(top20_upreg_endo_markers)
+
+write.csv(
+  top20_upreg_endo_markers,
+  file = file.path(plot_dir,"top20_upreg_markers_per_endo_subcluster.csv"),
+  row.names = FALSE
+)
+
+# Identify upregulated markers for each cluster (1 vs All Approach)
+downregulated_endo_markers <- FindAllMarkers(
+  subset_endo_region,
+  only.neg = TRUE,
+  logfc.threshold = 0.25,
+  min.pct = 0.25,
+  assay = "SCT"
+)
+
+# Top 20 downregulated by average log2FC
+top20_downreg_endo_markers <- downregulated_endo_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 20)
+
+View(top20_downreg_endo_markers)
+
+write.csv(
+  top20_downreg_endo_markers,
+  file = file.path(plot_dir,"top20_downreg_markers_per_endo_subcluster.csv"),
+  row.names = FALSE
+)
+
+# WDLPS marker set
+WDLPS_up_genes <- c("MDM2", "CDK4", "HMGA2", "JUN", "FRS2", "E2F1", "CDKN2A", "INSM1", "MLLT10", "MLL", "NEBL", "BMI1", "P16", "TSPAN31", "YEATS4", "CPM")         # upregulated in LPS subtype
+WDLPS_down_genes <- c("RUNX3", "ARID1A", "ATM", "CHEK1", "MIR15A", "MIR16-1", "SORBS1", "KRT8", "MT1G", "CEBPA", "PPARG", "DOG1", "S100")        # downregulated in LPS subtype
+
+# Compute signed average
+subset_endo_region <- compute_signed_average(subset_endo_region, WDLPS_up_genes, WDLPS_down_genes, label = "WDLPS_signature")
+
+# Visualise
+WDLPS_features <- FeaturePlot(
+  subset_endo_region,
+  features = "SignedAvg_WDLPS_signature",
+  reduction = "umap"
+) +
+  scale_color_gradient2(
+    low = "blue",       # Downregulated
+    mid = "lightgrey",  # Neutral
+    high = "red",       # Upregulated
+    midpoint = 0        # Center the color scale at 0
+  ) +
+  ggtitle("Signed Average WDLPS Signature Score")
+
+ggsave(file.path(plot_dir, "endo_WDLPS_features.pdf"), WDLPS_features, width = 8, height = 5)
+
+# DDLPS marker set
+DDLPS_up_genes <- c("MDM2", "CDK4", "HMGA2", "JUN", "TSPAN31", "YEATS4", "CPM", "FRS2", "E2F1", "CDKN2A", "INSM1", "ASK1", "DDR2", "ERBB3", "STAT6", "FGFR1", "MAP3K5", "LGR5", "MCL1", "CALR", "AQP7", "ACACB", "FZD4", "GPD1", "LEP", "ROS1", "APP", "CDK1", "PCNA", "TKT", "CDC20", "BUB1B", "BARD1", "ADRB2", "LGALS3", "CAV1", "CCNA2", "CRT", "CD47", "SIAH2", "ATRX", "DAXX", "CENPF", "FGFR1", "FGFR2", "FGFR3", "FGFR4", "FRS2", "CD34", "P16")         # upregulated in LPS subtype
+DDLPS_down_genes <- c("RUNX3", "ARID1A", "ATM", "CHEK1", "MIR15A", "MIR16-1", "SORBS1", "KRT8", "MT1G", "CEBPA", "PPARG", "DOG1", "S100")        # downregulated in LPS subtype
+
+# Compute signed average
+subset_endo_region <- compute_signed_average(subset_endo_region, DDLPS_up_genes, DDLPS_down_genes, label = "DDLPS_signature")
+
+# Visualise
+DDLPS_features <- FeaturePlot(
+  subset_endo_region,
+  features = "SignedAvg_DDLPS_signature",
+  reduction = "umap"
+) +
+  scale_color_gradient2(
+    low = "blue",       # Downregulated
+    mid = "lightgrey",  # Neutral
+    high = "red",       # Upregulated
+    midpoint = 0        # Center the color scale at 0
+  ) +
+  ggtitle("Signed Average DDLPS Signature Score")
+
+ggsave(file.path(plot_dir, "endo_DDLPS_features.pdf"), DDLPS_features, width = 8, height = 5)
+
+# MLPS marker set
+MLPS_up_genes <- c("FUS-CHOP", "EWS-CHOP", "MET", "RET", "IGFR", "AXL", "EGFR", "VEGFR2", "PIK3CA", "C228T", "C250T", "TERT", "ATRX", "DAXX", "CTAG1B", "CTAG2", "MAGEA9", "PRAME", "CHSY1", "STAT6")         # upregulated in LPS subtype
+MLPS_down_genes <- c("PTEN", "EFEMP1", "THBS2", "MDM2", "CDK4", "HMGA2", "TSPAN31")        # downregulated in LPS subtype
+
+# Compute signed average
+subset_endo_region <- compute_signed_average(subset_endo_region, MLPS_up_genes, MLPS_down_genes, label = "MLPS_signature")
+
+# Visualise
+MLPS_features <- FeaturePlot(
+  subset_endo_region,
+  features = "SignedAvg_MLPS_signature",
+  reduction = "umap"
+) +
+  scale_color_gradient2(
+    low = "blue",       # Downregulated
+    mid = "lightgrey",  # Neutral
+    high = "red",       # Upregulated
+    midpoint = 0        # Center the color scale at 0
+  ) +
+  ggtitle("Signed Average MLPS Signature Score")
+
+ggsave(file.path(plot_dir, "endo_MLPS_features.pdf"), MLPS_features, width = 8, height = 5)
+
+# PLPS marker set
+PLPS_up_genes <- c("TP53", "PPARG", "BCL2", "VEGF", "MMP2", "CEBPA")         # upregulated in LPS subtype
+PLPS_down_genes <- c("NF1", "CEBPA", "EP300", "RB1", "TP53")        # downregulated in LPS subtype
+
+# Compute signed average
+subset_endo_region <- compute_signed_average(subset_endo_region, PLPS_up_genes, PLPS_down_genes, label = "PLPS_signature")
+
+# Visualise
+PLPS_features <- FeaturePlot(
+  subset_endo_region,
+  features = "SignedAvg_PLPS_signature",
+  reduction = "umap"
+) +
+  scale_color_gradient2(
+    low = "blue",       # Downregulated
+    mid = "lightgrey",  # Neutral
+    high = "red",       # Upregulated
+    midpoint = 0        # Center the color scale at 0
+  ) +
+  ggtitle("Signed Average PLPS Signature Score")
+
+ggsave(file.path(plot_dir, "endo_PLPS_features.pdf"), PLPS_features, width = 8, height = 5)
+
+# MPLPS marker set
+MPLPS_down_genes <- c("RB1")        # downregulated in LPS subtype
+
+# Compute signed average
+#subset_endo_region <- compute_signed_average(subset_endo_region, MPLPS_up_genes, MPLPS_down_genes, label = "MPLPS_signature")
+
+# Visualise
+#MPLPS_features <- FeaturePlot(
+ # subset_endo_region,
+  #features = "SignedAvg_MPLPS_signature",
+#  reduction = "umap"
+#) +
+ # scale_color_gradient2(
+  #  low = "blue",       # Downregulated
+   # mid = "lightgrey",  # Neutral
+    #high = "red",       # Upregulated
+#    midpoint = 0        # Center the color scale at 0
+ # ) +
+  #ggtitle("Signed Average MPLPS Signature Score")
+
+#ggsave(file.path(plot_dir, "endo_MPLPS_features.pdf"), MPLPS_features, width = 8, height = 5)
+
+```
+
+```{r}
+# Set cluster identities (if not already set)
+Idents(subset_endo_region) <- "seurat_clusters"
+
+# Define your subtype mapping
+subtype_labels <- c(
+  "1"  = "Capillary Endothelial Cells",
+  "5"  = "Capillary Endothelial Cells [Tumour-Related]",
+  "6" = "Venular Endothelial Cells [Tumour-Related]",
+  "13"  = "Arterial Endothelial Cells"
+)
+
+# Add subtype labels to metadata
+subset_endo_region$endo_subtype_label <- plyr::mapvalues(
+  x = as.character(subset_endo_region$seurat_clusters),
+  from = names(subtype_labels),
+  to = subtype_labels,
+  warn_missing = FALSE
+)
+
+# Set NA for unlabeled clusters
+subset_endo_region$endo_subtype_label[is.na(subset_endo_region$endo_subtype_label)] <- "Unlabelled"
+
+# Confirm label distribution
+table(subset_endo_region$endo_subtype_label)
+
+```
+
+```{r}
+# 1. Prepare Hallmark gene sets
+msig_h_df <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, entrez_gene)
+
+# 2. Set identities (if not already set)
+Idents(subset_endo_region) <- "seurat_clusters"
+
+# 3. Choose a tumour cluster (e.g., "0", "1", etc.)
+# You can check available clusters with:
+print(levels(Idents(subset_endo_region)))
+
+# Define the cluster to analyse
+target_cluster <- "13"  # change this to your desired tumour subcluster
+
+# 4. Get DEGs for this cluster vs all others
+deg <- FindMarkers(
+  subset_endo_region,
+  ident.1 = target_cluster,
+  only.pos = FALSE,
+  logfc.threshold = 0,
+  min.pct = 0.05
+)
+
+# Add gene symbols to a column
+deg$gene <- rownames(deg)
+
+# 5. Map gene symbols to ENTREZ IDs
+deg_mapped <- bitr(
+  deg$gene,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+) %>%
+  inner_join(deg, by = c("SYMBOL" = "gene"))
+
+# 6. Prepare ranked gene list
+gene_list <- deg_mapped %>%
+  arrange(desc(avg_log2FC)) %>%
+  distinct(ENTREZID, .keep_all = TRUE) %>%
+  pull(avg_log2FC)
+names(gene_list) <- deg_mapped$ENTREZID
+
+# 7. Run GSEA
+gsea_res <- GSEA(
+  geneList = gene_list,
+  TERM2GENE = msig_h_df,
+  pvalueCutoff = 0.05,
+  verbose = TRUE,
+  minGSSize = 10,          
+  maxGSSize = 1000,          
+  nPermSimple = 10000 
+)
+
+# 8. Save results
+write.csv(
+  gsea_res@result,
+  file = file.path(plot_dir, paste0("GSEA_tumour_cluster_", target_cluster, ".csv")),
+  row.names = FALSE
+)
+
+if (!requireNamespace("enrichplot", quietly = TRUE)) BiocManager::install("enrichplot")
+library(enrichplot)
+
+# 9. Plot top enriched pathways
+pdf(file.path(plot_dir, paste0("GSEA_dotplot_cluster_", target_cluster, ".pdf")), width = 10, height = 6)
+dotplot(gsea_res, showCategory = 15, title = paste("GSEA: Tumour Cluster", target_cluster))
+dev.off()
+
+```
+
+Consensus Annotation based on broad SingleR and Manual Annotation with Canonical Markers
+```{r}
+##### Set up plot output directory ####
+
+plot_dir <- file.path("results", "liposarcoma", "final_annotations")
+dir.create(
+  plot_dir, 
+  recursive = TRUE, 
+  showWarnings = FALSE
+  )
+
+```
+
+```{r}
+# Define refined annotation per Seurat cluster
+refined_labels <- c(
+  "0"  = "CD4+ T Cells",
+  "1"  = "Capillary Endothelial Cells",
+  "2"  = "LPS",
+  "3"  = "LPS",
+  "4"  = "LPS",
+  "5"  = "Capillary Endothelial Cells [Tumour-Related]",
+  "6"  = "Venual Endothelial Cells [Tumour-Related]",
+  "7"  = "NK Cells",
+  "8"  = "Neutrophils and M1 Macrophages",
+  "9"  = "Smooth Muscle Cells",
+  "10" = "CD8+ T Cells",
+  "11" = "M2 Macrophages",
+  "12" = "Tumour-Associated Cells",
+  "13" = "Arterial Endothelial Cells",
+  "14" = "B Cells"
+)
+
+# Map to Seurat clusters
+combined_lipo$refined_annotation <- plyr::mapvalues(
+  x = as.character(combined_lipo$seurat_clusters),
+  from = names(refined_labels),
+  to = refined_labels
+)
+
+```
+
+
+```{r}
+# Assign refined_annotation as cluster-level labels
+cluster_labels_refined <- combined_lipo@meta.data %>%
+  dplyr::select(seurat_clusters, refined_annotation) %>%
+  dplyr::group_by(seurat_clusters, refined_annotation) %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+  dplyr::arrange(desc(n)) %>%
+  dplyr::distinct(seurat_clusters, .keep_all = TRUE)
+
+# Convert to named vector for mapping
+cluster_to_refined <- setNames(cluster_labels_refined$refined_annotation, cluster_labels_refined$seurat_clusters)
+
+# Map refined annotation back to all cells
+combined_lipo$cluster_refined_label <- plyr::mapvalues(
+  x = as.character(combined_lipo$seurat_clusters),
+  from = names(cluster_to_refined),
+  to = cluster_to_refined
+)
+
+# Visualise clusters with refined annotation
+refined_tsne_plot <- DimPlot(
+  combined_lipo,
+  group.by = "cluster_refined_label",
+  reduction = "tsne",
+  label = TRUE,
+  repel = TRUE
+) + ggtitle("Final Cell Type Annotations (t-SNE)") +
+  xlab("t-SNE 1") +
+  ylab("t-SNE 2")
+
+# Save plot
+ggsave(
+  filename = file.path(plot_dir, "combined_lipo_tSNE_Refined_Cluster_Labels.pdf"),
+  plot = refined_tsne_plot,
+  width = 15,
+  height = 8
+)
+
+# Visualise clusters with refined annotation
+refined_umap_plot <- DimPlot(
+  combined_lipo,
+  group.by = "cluster_refined_label",
+  reduction = "umap",
+  label = TRUE,
+  repel = TRUE
+) + ggtitle("Final Cell Type Annotations (UMAP") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2")
+
+# Save plot
+ggsave(
+  filename = file.path(plot_dir, "combined_lipo_UMAP_Refined_Cluster_Labels.pdf"),
+  plot = refined_umap_plot,
+  width = 15,
+  height = 8
+)
+
+```
+
+Subclustering of Major Lineages
+```{r}
+##### Set up plot output directory ####
+
+plot_dir <- file.path("results", "liposarcoma", "subclustering_plots")
+dir.create(
+  plot_dir, 
+  recursive = TRUE, 
+  showWarnings = FALSE
+  )
+
+```
+
+```{r}
+##### Extract UMAP Coordinates For Tumour Clusters #####
+# --- select only aneuploid cells in clusters 2, 3, 4 ---
+target_clusters <- c("2", "3", "4")
+
+cells_c234_tumour <- colnames(combined_lipo)[
+  !is.na(combined_lipo$tumour_status) &
+  combined_lipo$tumour_status == "Tumour" &
+  as.character(combined_lipo$seurat_clusters) %in% target_clusters
+]
+
+# sanity check (optional)
+message("Selected cells: ", length(cells_c234_tumour))
+
+subset_c234_region <- subset(combined_lipo, cells = cells_c234_tumour)
+
+# keep only the relevant cluster labels as a factor
+subset_c234_region$seurat_clusters <- droplevels(
+  factor(subset_c234_region$seurat_clusters, levels = target_clusters)
+)
+Idents(subset_c234_region) <- "seurat_clusters"
+
+# --- re-SCT (no nCount_RNA regression with SCT) ---
+subset_c234_region <- SCTransform(
+  subset_c234_region,
+  assay = "RNA",
+  new.assay.name = "SCT",
+  vars.to.regress = "percent.mt",
+  verbose = TRUE
+)
+DefaultAssay(subset_c234_region) <- "SCT"
+
+# --- plot using existing (global) UMAP just for a quick look ---
+tumour_subset_umap <- DimPlot(
+  subset_c234_region,
+  reduction = "umap",
+  group.by = "seurat_clusters",
+  label = TRUE,
+  label.size = 6
+) +
+  ggtitle("Aneuploid (CopyKAT) Cells in Clusters 2, 3, and 4") +
+  xlab("UMAP 1") + ylab("UMAP 2")
+
+ggsave(
+  file = file.path(plot_dir, "umap_tumour_subset.pdf"),
+  plot = tumour_subset_umap,
+  width = 12, height = 8
+)
+
+```
+
+
+```{r}
+# Subclustering Tumour Clusters: 2, 3, 4
+# subset_tumour_region
+subset_c234_region$sample <- factor(subset_c234_region$sample)
+subset_c234_region <- RunPCA(subset_c234_region, verbose = FALSE)
+
+ElbowPlot(subset_c234_region, ndims = 50) +
+  ggtitle("Elbow Plot to Determine Optimal Number of PCs")
+elbow_func(subset_c234_region)
+dims_to_use <- 1:7
+subset_c234_region <- FindNeighbors(subset_c234_region, reduction = "harmony", dims = dims_to_use)
+subset_c234_region <- FindClusters(subset_c234_region, resolution = seq(0.1, 1.5, by = 0.1))
+
+# Visualise how clusters evolve across resolutions by creating a clustree
+clustree_plot <- clustree(
+  subset_c234_region,
+  prefix = "SCT_snn_res."
+  )
+print(clustree_plot)
+
+# Save the clustree plot
+ggsave(
+  file.path(plot_dir, "tumour_subset_Clustree.pdf"),
+  clustree_plot,
+  width = 10,
+  height = 15
+  )
+
+# Set the optimal resolution
+Idents(subset_c234_region) <- "SCT_snn_res.1.2"
+
+subset_c234_region <- RunUMAP(subset_c234_region, reduction = "harmony", dims = dims_to_use)
+
+subset_c234_region$sub_cluster <- Idents(subset_c234_region)
+Idents(subset_c234_region) <- "sub_cluster"
+
+tumour_subset_umap <- DimPlot(subset_c234_region, reduction = "umap", label = TRUE) +
+  ggtitle("Subclustered Tumour Population (UMAP)") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2")
+ggsave(tumour_subset_umap, file = file.path(plot_dir, "tumour_subset_umap.pdf"), width =8, height = 6)
+
+tumour_subset_umap_by_sample <- DimPlot(subset_c234_region, reduction = "umap", label = TRUE, group.by = 'sample') +
+  ggtitle("Subclustered Tumour Population (UMAP)") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2")
+ggsave(tumour_subset_umap_by_sample, file = file.path(plot_dir, "tumour_subset_umap_by_sample.pdf"), width =8, height = 6)
+
+# Define gene list (deduplicated)
+gene_list <- c("MDM2", "CDK4", "HMGA2", "JUN", "FRS2", "E2F1", "CDKN2A", "INSM1", "MLLT10", "MLL", "NEBL", "BMI1", "P16", "TSPAN31", "YEATS4", "CPM", "RUNX3", "ARID1A", "ATM", "CHEK1", "MIR15A", "MIR16-1", "SORBS1", "KRT8", "MT1G", "CEBPA", "PPARG", "DOG1", "S100", "ASK1", "DDR2", "ERBB3", "STAT6", "FGFR1", "MAP3K5", "LGR5", "MCL1", "CALR", "AQP7", "ACACB", "FZD4", "GPD1", "LEP", "ROS1", "APP", "CDK1", "PCNA", "TKT", "CDC20", "BUB1B", "BARD1", "ADRB2", "LGALS3", "CAV1", "CCNA2", "CRT", "CD47", "SIAH2", "ATRX", "DAXX", "CENPF", "CD34", "FUS-CHOP", "EWS-CHOP", "MET", "RET", "IGFR", "AXL", "EGFR", "VEGFR2", "PIK3CA", "C228T", "C250T", "TERT", "CTAG1B", "CTAG2", "MAGEA9", "PRAME", "CHSY1", "PTEN", "EFEMP1", "THBS2", "TP53", "BCL2", "VEGF", "MMP2", "NF1", "EP300", "RB1")
+
+
+# Create output PDF file
+pdf(file = file.path(plot_dir, "tumour_subset_FeaturePlots.pdf"), width = 7, height = 6)
+
+# Loop through genes and plot
+for (gene in gene_list) {
+  if (gene %in% rownames(subset_c234_region)) {
+    print(
+      FeaturePlot(
+        subset_c234_region,
+        features = gene,
+        reduction = "umap",
+        min.cutoff = 0,
+        max.cutoff = 6
+      ) +
+      ggtitle(gene) +
+      xlab("UMAP 1") +
+      ylab("UMAP 2") +
+      scale_colour_gradientn(
+        colours = c("grey90", "blue", "purple", "red"),
+        limits = c(0, 6),
+        oob = scales::squish  # clips values outside range
+      )
+    )
+  } else {
+    message(paste("Skipping:", gene, "- not found in dataset"))
+  }
+}
+
+dev.off()
+
+```
+
+```{r}
+subset_c234_region <- PrepSCTFindMarkers(subset_c234_region)
+
+# Identify upregulated markers for each cluster (1 vs All Approach)
+upregulated_tumour_markers <- FindAllMarkers(
+  subset_c234_region,
+  only.pos = TRUE,
+  logfc.threshold = 0.25,
+  min.pct = 0.25,
+  assay = "SCT"
+)
+
+# Top 20 upregulated by average log2FC
+top20_upreg_tumour_markers <- upregulated_tumour_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 20)
+
+View(top20_upreg_tumour_markers)
+
+write.csv(
+  top20_upreg_tumour_markers,
+  file = file.path(plot_dir,"top20_upreg_markers_per_tumour_subcluster.csv"),
+  row.names = FALSE
+)
+
+# Identify upregulated markers for each cluster (1 vs All Approach)
+downregulated_tumour_markers <- FindAllMarkers(
+  subset_c234_region,
+  only.neg = TRUE,
+  logfc.threshold = 0.25,
+  min.pct = 0.25,
+  assay = "SCT"
+)
+
+# Top 20 downregulated by average log2FC
+top20_downreg_tumour_markers <- downregulated_tumour_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 20)
+
+View(top20_downreg_tumour_markers)
+
+write.csv(
+  top20_downreg_tumour_markers,
+  file = file.path(plot_dir,"top20_downreg_markers_per_tumour_subcluster.csv"),
+  row.names = FALSE
+)
+
+# WDLPS marker set
+WDLPS_up_genes <- c("MDM2", "CDK4", "HMGA2", "FRS2", "INSM1", "MLLT10", "MLL", "NEBL", "BMI1", "TSPAN31", "YEATS4", "CPM")         # upregulated in LPS subtype
+WDLPS_down_genes <- c("RUNX3", "ARID1A", "ATM", "CHEK1", "MIR15A", "MIR16-1", "SORBS1", "KRT8", "MT1G", "CEBPA", "PPARG", "DOG1", "S100")        # downregulated in LPS subtype
+
+# Compute signed average
+subset_c234_region <- compute_signed_average(subset_c234_region, WDLPS_up_genes, WDLPS_down_genes, label = "WDLPS_signature")
+
+fixed_min <- -2.0
+fixed_max <-  2.0
+
+# Visualise
+WDLPS_features <- FeaturePlot(
+  subset_c234_region,
+  features = "SignedAvg_WDLPS_signature",
+  reduction = "umap"
+) +
+  scale_color_gradient2(
+    low = "blue",       # Downregulated
+    mid = "lightgrey",  # Neutral
+    high = "red",       # Upregulated
+    midpoint = 0,        # Center the color scale at 0
+    limits = c(fixed_min, fixed_max),
+    oob = scales::squish
+  ) +
+  ggtitle("Signed Average WDLPS Signature Score")
+
+ggsave(file.path(plot_dir, "tumour_WDLPS_features.pdf"), WDLPS_features, width = 8, height = 5)
+
+# DDLPS marker set
+DDLPS_up_genes <- c("MDM2", "CDK4", "HMGA2", "JUN", "TSPAN31", "YEATS4", "CPM", "FRS2", "E2F1", "CDKN2A", "FGFR1", "MAP3K5", "FGFR1", "FGFR2", "FGFR3", "FGFR4", "CD34")         # upregulated in LPS subtype
+DDLPS_down_genes <- c("RUNX3", "ARID1A", "ATM", "CHEK1", "MIR15A", "MIR16-1", "SORBS1", "KRT8", "MT1G", "PPARG", "DOG1", "S100")        # downregulated in LPS subtype
+
+# Compute signed average
+subset_c234_region <- compute_signed_average(subset_c234_region, DDLPS_up_genes, DDLPS_down_genes, label = "DDLPS_signature")
+
+# Visualise
+DDLPS_features <- FeaturePlot(
+  subset_c234_region,
+  features = "SignedAvg_DDLPS_signature",
+  reduction = "umap"
+) +
+  scale_color_gradient2(
+    low = "blue",       # Downregulated
+    mid = "lightgrey",  # Neutral
+    high = "red",       # Upregulated
+    midpoint = 0,        # Center the color scale at 0
+    limits = c(fixed_min, fixed_max),
+    oob = scales::squish
+  ) +
+  ggtitle("Signed Average DDLPS Signature Score")
+
+ggsave(file.path(plot_dir, "tumour_DDLPS_features.pdf"), DDLPS_features, width = 8, height = 5)
+
+# MLPS marker set
+MLPS_up_genes <- c("FUS-CHOP", "EWS-CHOP", "MET", "RET", "IGFR", "AXL", "EGFR", "VEGFR2", "PIK3CA", "C228T", "C250T", "TERT", "ATRX", "DAXX", "CTAG1B", "CTAG2", "MAGEA9", "PRAME", "CHSY1", "STAT6")         # upregulated in LPS subtype
+MLPS_down_genes <- c("PTEN", "EFEMP1", "THBS2", "MDM2", "CDK4", "HMGA2", "TSPAN31")        # downregulated in LPS subtype
+
+# Compute signed average
+subset_c234_region <- compute_signed_average(subset_c234_region, MLPS_up_genes, MLPS_down_genes, label = "MLPS_signature")
+
+# Visualise
+MLPS_features <- FeaturePlot(
+  subset_c234_region,
+  features = "SignedAvg_MLPS_signature",
+  reduction = "umap"
+) +
+  scale_color_gradient2(
+    low = "blue",       # Downregulated
+    mid = "lightgrey",  # Neutral
+    high = "red",       # Upregulated
+    midpoint = 0,        # Center the color scale at 0
+    limits = c(fixed_min, fixed_max),
+    oob = scales::squish
+  ) +
+  ggtitle("Signed Average MLPS Signature Score")
+
+ggsave(file.path(plot_dir, "tumour_MLPS_features.pdf"), MLPS_features, width = 8, height = 5)
+
+# PLPS marker set
+PLPS_up_genes <- c("TP53", "PPARG", "BCL2", "VEGF", "MMP2", "CEBPA")         # upregulated in LPS subtype
+PLPS_down_genes <- c("NF1", "CEBPA", "EP300", "RB1", "TP53")        # downregulated in LPS subtype
+
+# Compute signed average
+subset_c234_region <- compute_signed_average(subset_c234_region, PLPS_up_genes, PLPS_down_genes, label = "PLPS_signature")
+
+# Visualise
+PLPS_features <- FeaturePlot(
+  subset_c234_region,
+  features = "SignedAvg_PLPS_signature",
+  reduction = "umap"
+) +
+  scale_color_gradient2(
+    low = "blue",       # Downregulated
+    mid = "lightgrey",  # Neutral
+    high = "red",       # Upregulated
+    midpoint = 0,        # Center the color scale at 0
+    limits = c(fixed_min, fixed_max),
+    oob = scales::squish
+  ) +
+  ggtitle("Signed Average PLPS Signature Score")
+
+ggsave(file.path(plot_dir, "tumour_PLPS_features.pdf"), PLPS_features, width = 8, height = 5)
+
+```
+
+```{r}
+# Define your subtype mapping
+subtype_labels <- c(
+  "0" = "DDLPS",
+  "1" = "DDLPS",
+  "2" = "DDLPS",
+  "3" = "DDLPS",
+  "4" = "DDLPS",
+  "5" = "DDLPS",
+  "6" = "DDLPS",
+  "7" = "DDLPS",
+  "8" = "DDLPS"
+)
+
+# Add subtype labels to metadata
+subset_c234_region$tumour_subtype_label <- plyr::mapvalues(
+  x = as.character(subset_c234_region$seurat_clusters),
+  from = names(subtype_labels),
+  to = subtype_labels,
+  warn_missing = FALSE
+)
+
+# Set NA for unlabeled clusters
+subset_c234_region$tumour_subtype_label[is.na(subset_c234_region$tumour_subtype_label)] <- "Unlabelled"
+
+# Confirm label distribution
+table(subset_c234_region$tumour_subtype_label)
+
+```
+
+```{r}
+# 1. Prepare Hallmark gene sets
+msig_h_df <- msigdbr(species = "Homo sapiens", collection = "H") %>%
+  dplyr::select(gs_name, ncbi_gene)
+
+# 2. Set identities (if not already set)
+Idents(subset_c234_region) <- "seurat_clusters"
+
+# 3. Choose a tumour cluster (e.g., "0", "1", etc.)
+# You can check available clusters with:
+print(levels(Idents(subset_c234_region)))
+
+# Define the cluster to analyse
+target_cluster <- "8"  # change this to your desired tumour subcluster
+
+# 4. Get DEGs for this cluster vs all others
+deg <- FindMarkers(
+  subset_c234_region,
+  ident.1 = target_cluster,
+  only.pos = FALSE,
+  logfc.threshold = 0,
+  min.pct = 0.05
+)
+
+# Add gene symbols to a column
+deg$gene <- rownames(deg)
+length(deg$gene)
+
+# 5. Map gene symbols to ENTREZ IDs
+deg_mapped <- bitr(
+  deg$gene,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+) %>%
+  inner_join(deg, by = c("SYMBOL" = "gene"))
+
+nrow(deg_mapped)
+
+# 6. Prepare ranked gene list
+gene_list <- deg_mapped %>%
+  arrange(desc(avg_log2FC)) %>%
+  distinct(ENTREZID, .keep_all = TRUE) %>%
+  pull(avg_log2FC)
+names(gene_list) <- deg_mapped$ENTREZID
+
+# 7. Run GSEA
+gsea_res <- GSEA(
+  geneList = gene_list,
+  TERM2GENE = msig_h_df,
+  pvalueCutoff = 0.05,
+  verbose = TRUE,
+  minGSSize = 10,          
+  maxGSSize = 1000,          
+  nPermSimple = 10000 
+)
+
+# 8. Save results
+write.csv(
+  gsea_res@result,
+  file = file.path(plot_dir, paste0("GSEA_tumour_cluster_", target_cluster, ".csv")),
+  row.names = FALSE
+)
+
+if (!requireNamespace("enrichplot", quietly = TRUE)) BiocManager::install("enrichplot")
+library(enrichplot)
+
+# 9. Plot top enriched pathways
+pdf(file.path(plot_dir, paste0("GSEA_dotplot_cluster_", target_cluster, ".pdf")), width = 10, height = 6)
+dotplot(gsea_res, showCategory = 15, title = paste("GSEA: Tumour Cluster", target_cluster))
+dev.off()
+
+```
+
+```{r}
+# Subclustering Endothelial Clusters: 1, 5, 6, 13
+# subset_endo_region
+subset_endo_region <- RunPCA(subset_endo_region, verbose = FALSE)
+
+ElbowPlot(subset_endo_region, ndims = 50) +
+  ggtitle("Elbow Plot to Determine Optimal Number of PCs")
+elbow_func(subset_endo_region)
+dims_to_use <- 1:8
+
+subset_endo_region <- FindNeighbors(subset_endo_region, dims = dims_to_use)
+
+# Cluster cells at multiple resolutions for comparison
+subset_endo_region <- FindClusters(
+  subset_endo_region,
+  resolution = seq(0.1, 1.5, by = 0.1)
+  )
+
+# Visualise how clusters evolve across resolutions by creating a clustree
+clustree_plot <- clustree(
+  subset_endo_region,
+  prefix = "SCT_snn_res."
+  )
+print(clustree_plot)
+
+# Save the clustree plot
+ggsave(
+  file.path(plot_dir, "endo_subset_Clustree.pdf"),
+  clustree_plot,
+  width = 10,
+  height = 15
+  )
+
+# Set the optimal resolution
+Idents(subset_endo_region) <- "SCT_snn_res.0.7"
+
+subset_endo_region <- RunUMAP(subset_endo_region, dims = dims_to_use)
+endo_subset_umap <- DimPlot(subset_endo_region, reduction = "umap", label = TRUE) +
+  ggtitle("Subclustered Endothelial Population (UMAP)") +
+  xlab("UMAP 1") +
+  ylab("UMAP 2")
+ggsave(endo_subset_umap, file = file.path(plot_dir, "endo_subset_umap.pdf"), width = 8, height = 6)
+
+# Define gene list (deduplicated)
+gene_list <- unique(c(
+  "MDM2", "CDK4", "HMGA2", "TSPAN31", "FAM105A", "LINC01239", "PLIN1", "PLIN2", "FABP4", "ADIPOQ", "PPARG",
+  "FRS2", "S100A1", "COL1A1", "COL3A1", "FN1", "VIM", "ZEB1", "SNAI2", "MK167", "TOP2A", "CDK1", "TGFB1",
+  "TGFBI", "TWIST1", "COL6A1", "PDGFRA", "PDGFRB", "SPP1", "MMP2", "MMP9", "CD44", "THY1", "LEP", "FUS-DDIT3",
+  "EWSR1-DDIT3", "CEBPA", "PLAG1", "LTBP2", "COL6A3", "TIMP3", "SPARC", "MEST", "GAS6", "NR4A1", "CHOP",
+  "DDIT3", "FUS-CHOP", "EWSR1-CHOP", "MET", "RET", "MUC4", "CTAG1B", "PCNA", "SOX2", "CXCL8", "IL6", "CCL2",
+  "BIRC5", "CD74", "HMGA1", "TP53", "RB1", "CDKN2A", "PRDM16", "FABP5", "S100B", "FAP", "COL4A1", "COL4A2",
+  "DCN", "SOX9", "POSTN", "CD34", "CD90", "S100", "CEBPB"
+))
+
+# Create output PDF file
+pdf(file = file.path(plot_dir, "endo_subset_FeaturePlots.pdf"), width = 7, height = 6)
+
+# Loop through genes and plot
+for (gene in gene_list) {
+  if (gene %in% rownames(subset_endo_region)) {
+    print(
+      FeaturePlot(
+        subset_endo_region,
+        features = gene,
+        reduction = "umap",
+        min.cutoff = 0,
+        max.cutoff = 6
+      ) +
+      ggtitle(gene) +
+      scale_colour_gradientn(
+        colours = c("grey90", "blue", "purple", "red"),
+        limits = c(0, 6),
+        oob = scales::squish  # clips values outside range
+      )
+    )
+  } else {
+    message(paste("Skipping:", gene, "- not found in dataset"))
+  }
+}
+
+dev.off()
+
+```
+
+
+
+```{r}
+# Subclustering aneuploid cells
+# seurat_tumour
+
+Idents(combined_lipo) <- "tumour_status"
+levels(Idents(combined_lipo))  # should show "Tumour", "Non-Tumour"
+
+table(combined_lipo$tumour_status)
+
+deg <- FindMarkers(
+  combined_lipo,
+  ident.1 = "Tumour",
+  ident.2 = "Non-Tumour",
+  logfc.threshold = 0,
+  min.pct = 0.1
+)
+
+# Add gene names to column
+deg$gene <- rownames(deg)
+
+# Define thresholds
+logfc_cutoff <- 2
+pval_cutoff <- 0.05
+
+# Add a label for plotting
+deg$significance <- "Not Significant"
+deg$significance[deg$p_val_adj < pval_cutoff & deg$avg_log2FC > logfc_cutoff] <- "Upregulated"
+deg$significance[deg$p_val_adj < pval_cutoff & deg$avg_log2FC < -logfc_cutoff] <- "Downregulated"
+
+library(ggplot2)
+
+library(ggrepel)
+
+top_genes <- deg %>% 
+  dplyr::filter(p_val_adj < pval_cutoff & abs(avg_log2FC) > logfc_cutoff) %>% 
+  dplyr::arrange(p_val_adj) %>% 
+  dplyr::slice_head(n = 50)
+
+aneuploid_vs_diploid_volcano <- ggplot(deg, aes(x = avg_log2FC, y = -log10(p_val_adj), color = significance)) +
+  geom_point(alpha = 0.8, size = 0.8) +
+  geom_text_repel(data = top_genes, aes(label = gene), size = 3) +
+  scale_color_manual(values = c("Upregulated" = "red", "Downregulated" = "blue", "Not Significant" = "grey")) +
+  geom_vline(xintercept = c(-logfc_cutoff, logfc_cutoff), linetype = "dashed") +
+  geom_hline(yintercept = -log10(pval_cutoff), linetype = "dashed") +
+  labs(title = "Volcano Plot: Top DEGs in Aneuploid Cells", x = "Average log2 Fold Change", y = "-log10 Adjusted p-value") +
+  theme_minimal()
+
+ggsave(aneuploid_vs_diploid_volcano, file = file.path("results", "liposarcoma", "aneuploid_vs_diploid_volcano_plot.pdf"), width = 8, height = 10)
+
+# Top 10 upregulated genes (highest avg_log2FC)
+top_upregulated <- deg %>%
+  dplyr::filter(significance == "Upregulated") %>%
+  dplyr::arrange(desc(avg_log2FC)) %>%
+  dplyr::slice_head(n = 10)
+
+# Top 10 downregulated genes (lowest avg_log2FC)
+top_downregulated <- deg %>%
+  dplyr::filter(significance == "Downregulated") %>%
+  dplyr::arrange(avg_log2FC) %>%
+  dplyr::slice_head(n = 10)
+
+# Display the results
+top_upregulated
+top_downregulated
+
+write.csv(top_upregulated, "results/liposarcoma/top_upregulated_genes.csv", row.names = FALSE)
+write.csv(top_downregulated, "results/liposarcoma/top_downregulated_genes.csv", row.names = FALSE)
+
+
+```
+
+
+
+
+
+
+
+
